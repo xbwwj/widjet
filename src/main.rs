@@ -1,1 +1,3 @@
+mod js;
+
 fn main() {}
