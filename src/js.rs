@@ -31,7 +31,7 @@ impl JsAgent {
 
 #[derive(JsLifetime)]
 #[rquickjs::class(rename_all = "camelCase")]
-struct WidgetCanvas {
+struct WidgetCanvas<'js> {
     width: u32,
     height: u32,
     // TODO: anchor
@@ -55,10 +55,11 @@ struct WidgetCanvas {
     // TODO: it seems that we should store separate width height to avoid
     // sending duplicate `set_size` to wayland server.
     wlr_layer_surface: Rc<ZwlrLayerSurfaceV1>,
+    context: Option<Class<'js, CanvasRenderingContext2D>>,
 }
 
 #[rquickjs::methods(rename_all = "camelCase")]
-impl WidgetCanvas {
+impl<'js> WidgetCanvas<'js> {
     #[qjs(constructor)]
     // TODO: parameters
     fn new(ctx: Ctx<'_>) -> Self {
@@ -100,6 +101,7 @@ impl WidgetCanvas {
             margin_bottom: 0,
             margin_left: 0,
             wlr_layer_surface,
+            context: None,
         }
     }
 
@@ -133,6 +135,22 @@ impl WidgetCanvas {
         self.wlr_layer_surface.destroy();
     }
 
+    fn get_context(
+        &mut self,
+        ty: String,
+        ctx: Ctx<'js>,
+    ) -> Option<Class<'js, CanvasRenderingContext2D>> {
+        if ty != "2d" {
+            return None;
+        }
+        if self.context.is_none() {
+            let context = CanvasRenderingContext2D {};
+            let obj = Class::instance(ctx, context).unwrap();
+            self.context = Some(obj);
+        }
+        Some(self.context.as_ref().unwrap().clone())
+    }
+
     fn add_event_listener(&self, _event: String) {
         todo!()
     }
@@ -140,7 +158,7 @@ impl WidgetCanvas {
     // TODO: getPopup
 }
 
-impl WidgetCanvas {
+impl<'js> WidgetCanvas<'js> {
     // PERF: currently we send set_size each time width/height is changed,
     // this hould be buffered and apply only in render cycle.
     fn send_size(&self) {
@@ -148,7 +166,7 @@ impl WidgetCanvas {
     }
 }
 
-impl<'js> Trace<'js> for WidgetCanvas {
+impl<'js> Trace<'js> for WidgetCanvas<'js> {
     fn trace<'a>(&self, _tracer: rquickjs::class::Tracer<'a, 'js>) {
         // nothing to trace
     }
