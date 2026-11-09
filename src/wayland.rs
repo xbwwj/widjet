@@ -1,8 +1,10 @@
 use wayland_client::{
     Connection, Dispatch, QueueHandle, delegate_noop,
-    protocol::{wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm},
+    protocol::{
+        wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_surface,
+    },
 };
-use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
+use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use crate::app::State;
 
@@ -25,8 +27,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     this.wl_compositor = Some(registry.bind(name, version.min(6), qh, ()))
                 }
                 "wl_shm" => this.wl_shm = Some(registry.bind(name, version.min(1), qh, ())),
-                "wl_seat" => {}
-                "zwlr_layer_shell_v1" => {}
+                "zwlr_layer_shell_v1" => {
+                    this.wlr_layer_shell = Some(registry.bind(name, version.min(5), qh, ()))
+                }
                 _ => {}
             },
             _ => {}
@@ -183,4 +186,24 @@ impl Dispatch<wl_callback::WlCallback, ()> for State {
     }
 }
 
+impl Dispatch<wl_surface::WlSurface, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &wl_surface::WlSurface,
+        event: <wl_surface::WlSurface as wayland_client::Proxy>::Event,
+        data: &(),
+        conn: &Connection,
+        qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_surface::Event::Enter { output } => todo!(),
+            wl_surface::Event::Leave { output } => todo!(),
+            wl_surface::Event::PreferredBufferScale { factor } => todo!(),
+            wl_surface::Event::PreferredBufferTransform { transform } => todo!(),
+            _ => {}
+        }
+    }
+}
+
 delegate_noop!(State: ignore wl_compositor::WlCompositor);
+delegate_noop!(State: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
