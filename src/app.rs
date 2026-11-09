@@ -6,6 +6,8 @@ use wayland_client::{
 };
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::ZwlrLayerShellV1;
 
+use crate::js::Agent;
+
 /// The full app state
 pub struct App {
     pub running: bool,
@@ -16,7 +18,10 @@ pub struct App {
     pub wl_shm: Option<WlShm>,
     pub wl_seat: Option<WlSeat>,
     pub wlr_layer_shell: Option<ZwlrLayerShellV1>,
-    // TODO: js context
+
+    // JS agent
+    pub agent: Agent,
+
     pub render_opportunity: bool,
 }
 
@@ -29,6 +34,7 @@ impl App {
             wl_shm: None,
             wl_seat: None,
             wlr_layer_shell: None,
+            agent: Agent::new(),
             render_opportunity: true,
         }
     }

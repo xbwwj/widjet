@@ -1,4 +1,24 @@
-use rquickjs::{JsLifetime, class::Trace};
+use rquickjs::{Class, Context, JsLifetime, Runtime, class::Trace};
+
+pub struct Agent {
+    rt: Runtime,
+    ctx: Context,
+}
+
+impl Agent {
+    pub fn new() -> Self {
+        let rt = Runtime::new().unwrap();
+        let ctx = Context::full(&rt).unwrap();
+
+        ctx.with(|ctx| {
+            let global = ctx.globals();
+            Class::<WidgetCanvas>::define(&global).unwrap();
+            Class::<CanvasRenderingContext2D>::define(&global).unwrap();
+        });
+
+        Self { rt, ctx }
+    }
+}
 
 #[derive(Trace, JsLifetime)]
 #[rquickjs::class(rename_all = "camelCase")]
