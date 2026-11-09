@@ -32,9 +32,7 @@ impl JsAgent {
 #[derive(JsLifetime)]
 #[rquickjs::class(rename_all = "camelCase")]
 struct WidgetCanvas {
-    #[qjs(get, set)]
     width: u32,
-    #[qjs(get, set)]
     height: u32,
     // TODO: anchor
     #[qjs(get, set)]
@@ -56,7 +54,7 @@ struct WidgetCanvas {
 
     // TODO: it seems that we should store separate width height to avoid
     // sending duplicate `set_size` to wayland server.
-    wlr_layer_surface: Rc<RefCell<ZwlrLayerSurfaceV1>>,
+    wlr_layer_surface: Rc<ZwlrLayerSurfaceV1>,
 }
 
 #[rquickjs::methods(rename_all = "camelCase")]
@@ -72,6 +70,7 @@ impl WidgetCanvas {
             .as_ref()
             .unwrap()
             .create_surface(&state.qh, ());
+
         let wlr_layer_surface = state.wlr_layer_shell.as_ref().unwrap().get_layer_surface(
             &wl_surface,
             None,
@@ -89,7 +88,7 @@ impl WidgetCanvas {
         // NOTE: ack configure should not be exposed to user script
         // but a resize event can fire on widget canvas.
 
-        let wlr_layer_surface = Rc::new(RefCell::new(wlr_layer_surface));
+        let wlr_layer_surface = Rc::new(wlr_layer_surface);
         // TODO: wlr layer surface should also be store in state for rendering stage.
 
         Self {
@@ -104,16 +103,48 @@ impl WidgetCanvas {
         }
     }
 
-    fn get_popup(&self) {
-        todo!()
+    #[qjs(get, rename = "width")]
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[qjs(set, rename = "width")]
+    fn set_width(&mut self, width: u32) {
+        if self.width != width {
+            self.width = width;
+            self.send_size();
+        }
+    }
+
+    #[qjs(get, rename = "height")]
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    #[qjs(set, rename = "height")]
+    fn set_height(&mut self, height: u32) {
+        if self.height != height {
+            self.height = height;
+            self.send_size();
+        }
     }
 
     fn destroy(&self) {
-        todo!()
+        self.wlr_layer_surface.destroy();
     }
 
     fn add_event_listener(&self, _event: String) {
         todo!()
+    }
+
+    // TODO: getPopup
+}
+
+impl WidgetCanvas {
+    // PERF: currently we send set_size each time width/height is changed,
+    // this hould be buffered and apply only in render cycle.
+    fn send_size(&self) {
+        self.wlr_layer_surface.set_size(self.width, self.height);
     }
 }
 
