@@ -1,15 +1,12 @@
 use wayland_client::{
     Connection, Dispatch, QueueHandle, delegate_noop,
-    protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_subsurface,
-    },
+    protocol::{wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm},
 };
-use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
-use crate::app::App;
+use crate::app::State;
 
-impl Dispatch<wl_registry::WlRegistry, ()> for App {
+impl Dispatch<wl_registry::WlRegistry, ()> for State {
     fn event(
         this: &mut Self,
         registry: &wl_registry::WlRegistry,
@@ -37,7 +34,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
     }
 }
 
-impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, u32> for App {
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, u32> for State {
     fn event(
         state: &mut Self,
         proxy: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
@@ -63,7 +60,7 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, u32> for App {
     }
 }
 
-impl Dispatch<wl_shm::WlShm, ()> for App {
+impl Dispatch<wl_shm::WlShm, ()> for State {
     fn event(
         state: &mut Self,
         proxy: &wl_shm::WlShm,
@@ -81,7 +78,7 @@ impl Dispatch<wl_shm::WlShm, ()> for App {
     }
 }
 
-impl Dispatch<wl_buffer::WlBuffer, ()> for App {
+impl Dispatch<wl_buffer::WlBuffer, ()> for State {
     fn event(
         state: &mut Self,
         proxy: &wl_buffer::WlBuffer,
@@ -99,7 +96,7 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for App {
     }
 }
 
-impl Dispatch<wl_seat::WlSeat, ()> for App {
+impl Dispatch<wl_seat::WlSeat, ()> for State {
     fn event(
         state: &mut Self,
         proxy: &wl_seat::WlSeat,
@@ -120,7 +117,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for App {
     }
 }
 
-impl Dispatch<wl_pointer::WlPointer, ()> for App {
+impl Dispatch<wl_pointer::WlPointer, ()> for State {
     fn event(
         state: &mut Self,
         proxy: &wl_pointer::WlPointer,
@@ -168,7 +165,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for App {
 // TODO: should differentialize userdata to ensure that is from frame.
 // also this should be per surface, (e.g. different output may have different vsync).
 // So e.g. `FrameCallback(usize)`
-impl Dispatch<wl_callback::WlCallback, ()> for App {
+impl Dispatch<wl_callback::WlCallback, ()> for State {
     fn event(
         state: &mut Self,
         proxy: &wl_callback::WlCallback,
@@ -186,4 +183,4 @@ impl Dispatch<wl_callback::WlCallback, ()> for App {
     }
 }
 
-delegate_noop!(App: ignore wl_compositor::WlCompositor);
+delegate_noop!(State: ignore wl_compositor::WlCompositor);

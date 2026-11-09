@@ -1,4 +1,11 @@
-use rquickjs::{Class, Context, JsLifetime, Runtime, class::Trace};
+use std::{
+    cell::RefCell,
+    rc::{Rc, Weak},
+};
+
+use rquickjs::{Class, Context, Ctx, JsLifetime, Runtime, class::Trace};
+
+use crate::app::State;
 
 pub struct Agent {
     rt: Runtime,
@@ -6,11 +13,13 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new() -> Self {
+    pub fn new(state: Rc<RefCell<State>>) -> Self {
         let rt = Runtime::new().unwrap();
         let ctx = Context::full(&rt).unwrap();
 
         ctx.with(|ctx| {
+            ctx.store_userdata(state).unwrap();
+
             let global = ctx.globals();
             Class::<WidgetCanvas>::define(&global).unwrap();
             Class::<CanvasRenderingContext2D>::define(&global).unwrap();
@@ -51,7 +60,7 @@ struct WidgetCanvas {
 impl WidgetCanvas {
     #[qjs(constructor)]
     // TODO: parameters
-    fn new() -> Self {
+    fn new(ctx: Ctx<'_>) -> Self {
         todo!()
     }
 
