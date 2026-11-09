@@ -1,3 +1,9 @@
-mod js;
+use crate::app::App;
 
-fn main() {}
+mod app;
+mod js;
+mod wayland;
+
+fn main() {
+    App::new().run();
+}
