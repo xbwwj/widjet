@@ -83,4 +83,3 @@ impl TextMetrics {
 impl<'js> Trace<'js> for TextMetrics {
     fn trace<'a>(&self, _tracer: rquickjs::class::Tracer<'a, 'js>) {}
 }
-

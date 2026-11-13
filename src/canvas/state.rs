@@ -266,4 +266,3 @@ mod tests {
         assert_eq!(font.weight, 400.0);
     }
 }
-

@@ -54,4 +54,3 @@ impl ImageBitmap {
 impl<'js> Trace<'js> for ImageBitmap {
     fn trace<'a>(&self, _tracer: rquickjs::class::Tracer<'a, 'js>) {}
 }
-

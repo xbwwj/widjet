@@ -29,7 +29,6 @@ pub enum PlatformEvent {
     Closed {
         widget_id: WidgetId,
     },
-    /// This surface's native frame clock has made its rAF callbacks eligible.
     FrameReady {
         widget_id: WidgetId,
     },
@@ -42,7 +41,9 @@ pub struct PlatformError {
 
 impl PlatformError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into() }
+        Self {
+            message: message.into(),
+        }
     }
 }
 
@@ -59,10 +60,7 @@ impl Error for PlatformError {}
 /// `None` means wait until a native event arrives. Implementations must never
 /// call JS or enqueue application tasks.
 pub trait PlatformEventSource {
-    fn dispatch(
-        &mut self,
-        timeout: Option<Duration>,
-    ) -> Result<Vec<PlatformEvent>, PlatformError>;
+    fn dispatch(&mut self, timeout: Option<Duration>) -> Result<Vec<PlatformEvent>, PlatformError>;
 }
 
 /// Native surface operations used by `ScriptThread`.

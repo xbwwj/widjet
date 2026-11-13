@@ -113,9 +113,7 @@ impl TaskQueue {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.user_interaction.is_empty()
-            && self.rendering.is_empty()
-            && self.timer.is_empty()
+        self.user_interaction.is_empty() && self.rendering.is_empty() && self.timer.is_empty()
     }
 
     /// Discard work that belongs to a surface which has been destroyed.
@@ -163,7 +161,10 @@ mod tests {
         );
 
         assert!(matches!(queue.pop(), Some(Task::Pointer { .. })));
-        assert!(matches!(queue.pop(), Some(Task::AnimationFrame { widget_id: 1 })));
+        assert!(matches!(
+            queue.pop(),
+            Some(Task::AnimationFrame { widget_id: 1 })
+        ));
         assert!(matches!(queue.pop(), Some(Task::Timer)));
         assert!(queue.is_empty());
     }
@@ -182,18 +183,15 @@ mod tests {
                 buttons: 0,
             },
         );
-        queue.push(
-            TaskSource::Rendering,
-            Task::AnimationFrame { widget_id: 7 },
-        );
-        queue.push(
-            TaskSource::Rendering,
-            Task::AnimationFrame { widget_id: 8 },
-        );
+        queue.push(TaskSource::Rendering, Task::AnimationFrame { widget_id: 7 });
+        queue.push(TaskSource::Rendering, Task::AnimationFrame { widget_id: 8 });
         queue.push(TaskSource::Timer, Task::Timer);
 
         queue.remove_widget_tasks(7);
-        assert!(matches!(queue.pop(), Some(Task::AnimationFrame { widget_id: 8 })));
+        assert!(matches!(
+            queue.pop(),
+            Some(Task::AnimationFrame { widget_id: 8 })
+        ));
         assert!(matches!(queue.pop(), Some(Task::Timer)));
         assert!(queue.is_empty());
     }
