@@ -1,24 +1,16 @@
-//! A small HTML-style task queue.
+//! The script thread's task queues.
 //!
-//! The runtime does not call into JS directly from platform callbacks. Every
-//! callback is queued as a task with a [`TaskSource`], then the event loop runs
-//! one task at a time and performs a microtask checkpoint after each one.
+//! Platform callbacks are normalized to `PlatformEvent` and then converted to
+//! tasks. JavaScript is only called while `ScriptThread` executes a task.
 
 use std::collections::VecDeque;
 
 use crate::canvas::WidgetId;
 
-/// The task sources this runtime currently distinguishes.
-///
-/// This mirrors the HTML distinction between task sources without implementing
-/// the full browser set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskSource {
-    /// Pointer input and other user-interaction events.
     UserInteraction,
-    /// Rendering work: resize steps and animation-frame callbacks.
     Rendering,
-    /// `setTimeout` / `setInterval`.
     Timer,
 }
 
@@ -36,13 +28,13 @@ pub enum PointerKind {
 impl PointerKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            PointerKind::Enter => "pointerenter",
-            PointerKind::Leave => "pointerleave",
-            PointerKind::Move => "pointermove",
-            PointerKind::Down => "pointerdown",
-            PointerKind::Up => "pointerup",
-            PointerKind::Click => "click",
-            PointerKind::ContextMenu => "contextmenu",
+            Self::Enter => "pointerenter",
+            Self::Leave => "pointerleave",
+            Self::Move => "pointermove",
+            Self::Down => "pointerdown",
+            Self::Up => "pointerup",
+            Self::Click => "click",
+            Self::ContextMenu => "contextmenu",
         }
     }
 }
@@ -62,7 +54,12 @@ pub enum Task {
         width: u32,
         height: u32,
     },
-    AnimationFrame,
+    Close {
+        widget_id: WidgetId,
+    },
+    AnimationFrame {
+        widget_id: WidgetId,
+    },
     Timer,
 }
 
@@ -71,26 +68,17 @@ pub struct TaskQueue {
     user_interaction: VecDeque<Task>,
     rendering: VecDeque<Task>,
     timer: VecDeque<Task>,
-    animation_frame_queued: bool,
     timer_queued: bool,
+    next_source: usize,
 }
 
 impl TaskQueue {
     pub fn push(&mut self, source: TaskSource, task: Task) {
-        match task {
-            Task::AnimationFrame => {
-                if self.animation_frame_queued {
-                    return;
-                }
-                self.animation_frame_queued = true;
+        if matches!(task, Task::Timer) {
+            if self.timer_queued {
+                return;
             }
-            Task::Timer => {
-                if self.timer_queued {
-                    return;
-                }
-                self.timer_queued = true;
-            }
-            _ => {}
+            self.timer_queued = true;
         }
 
         match source {
@@ -100,29 +88,52 @@ impl TaskQueue {
         }
     }
 
-    /// Pick the next task.
-    ///
-    /// User interaction is handled first, then rendering, then timers. This is
-    /// an implementation-defined ordering, like a browser's task-source
-    /// selection; the important part is that each queue is a real task source
-    /// and not a direct JS callback from the platform layer.
+    /// Select one task using round-robin task-source selection. The HTML
+    /// model does not define one global priority among task sources; round-robin
+    /// avoids starving timers or rendering when input is continuously queued.
     pub fn pop(&mut self) -> Option<Task> {
-        let task = self
-            .user_interaction
-            .pop_front()
-            .or_else(|| self.rendering.pop_front())
-            .or_else(|| self.timer.pop_front());
+        for offset in 0..3 {
+            let source = (self.next_source + offset) % 3;
+            let task = match source {
+                0 => self.user_interaction.pop_front(),
+                1 => self.rendering.pop_front(),
+                _ => self.timer.pop_front(),
+            };
+            let Some(task) = task else {
+                continue;
+            };
 
-        match task {
-            Some(Task::AnimationFrame) => self.animation_frame_queued = false,
-            Some(Task::Timer) => self.timer_queued = false,
-            _ => {}
+            self.next_source = (source + 1) % 3;
+            if matches!(task, Task::Timer) {
+                self.timer_queued = false;
+            }
+            return Some(task);
         }
-        task
+        None
     }
 
     pub fn is_empty(&self) -> bool {
-        self.user_interaction.is_empty() && self.rendering.is_empty() && self.timer.is_empty()
+        self.user_interaction.is_empty()
+            && self.rendering.is_empty()
+            && self.timer.is_empty()
+    }
+
+    /// Discard work that belongs to a surface which has been destroyed.
+    /// Timer tasks are global and are intentionally left untouched.
+    pub fn remove_widget_tasks(&mut self, widget_id: WidgetId) {
+        fn belongs_to(task: &Task, widget_id: WidgetId) -> bool {
+            match task {
+                Task::Pointer { widget_id: id, .. }
+                | Task::Resize { widget_id: id, .. }
+                | Task::Close { widget_id: id }
+                | Task::AnimationFrame { widget_id: id } => *id == widget_id,
+                Task::Timer => false,
+            }
+        }
+
+        self.user_interaction
+            .retain(|task| !belongs_to(task, widget_id));
+        self.rendering.retain(|task| !belongs_to(task, widget_id));
     }
 
     pub fn has_timer(&self) -> bool {
@@ -135,10 +146,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_sources_are_drained_in_priority_order() {
+    fn task_sources_are_selected_round_robin() {
         let mut queue = TaskQueue::default();
         queue.push(TaskSource::Timer, Task::Timer);
-        queue.push(TaskSource::Rendering, Task::AnimationFrame);
+        queue.push(TaskSource::Rendering, Task::AnimationFrame { widget_id: 1 });
         queue.push(
             TaskSource::UserInteraction,
             Task::Pointer {
@@ -152,22 +163,49 @@ mod tests {
         );
 
         assert!(matches!(queue.pop(), Some(Task::Pointer { .. })));
-        assert!(matches!(queue.pop(), Some(Task::AnimationFrame)));
+        assert!(matches!(queue.pop(), Some(Task::AnimationFrame { widget_id: 1 })));
         assert!(matches!(queue.pop(), Some(Task::Timer)));
         assert!(queue.is_empty());
     }
 
     #[test]
-    fn animation_frame_and_timer_tasks_are_coalesced() {
+    fn destroying_widget_discards_its_queued_tasks_only() {
         let mut queue = TaskQueue::default();
-        queue.push(TaskSource::Rendering, Task::AnimationFrame);
-        queue.push(TaskSource::Rendering, Task::AnimationFrame);
-        queue.push(TaskSource::Timer, Task::Timer);
+        queue.push(
+            TaskSource::UserInteraction,
+            Task::Pointer {
+                widget_id: 7,
+                kind: PointerKind::Click,
+                x: 0.0,
+                y: 0.0,
+                button: 0,
+                buttons: 0,
+            },
+        );
+        queue.push(
+            TaskSource::Rendering,
+            Task::AnimationFrame { widget_id: 7 },
+        );
+        queue.push(
+            TaskSource::Rendering,
+            Task::AnimationFrame { widget_id: 8 },
+        );
         queue.push(TaskSource::Timer, Task::Timer);
 
-        assert!(queue.has_timer());
-        assert!(matches!(queue.pop(), Some(Task::AnimationFrame)));
+        queue.remove_widget_tasks(7);
+        assert!(matches!(queue.pop(), Some(Task::AnimationFrame { widget_id: 8 })));
         assert!(matches!(queue.pop(), Some(Task::Timer)));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn timer_tasks_are_coalesced() {
+        let mut queue = TaskQueue::default();
+        queue.push(TaskSource::Timer, Task::Timer);
+        queue.push(TaskSource::Timer, Task::Timer);
+        assert!(queue.has_timer());
+        assert!(matches!(queue.pop(), Some(Task::Timer)));
+        assert!(!queue.has_timer());
         assert!(queue.is_empty());
     }
 }

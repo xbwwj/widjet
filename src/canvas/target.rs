@@ -528,3 +528,4 @@ impl CanvasTarget for VelloCpuTarget {
         self.text_metrics(&layout, font_size)
     }
 }
+

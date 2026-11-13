@@ -1,11 +1,4 @@
 // Widjet JavaScript runtime.
-//
-// This file is evaluated once, after the native canvas classes have been
-// installed and before the user script runs. It provides:
-//
-// * `console` forwarding to the host process,
-// * a small DOM-like `EventTarget` implementation for `WidgetCanvas`,
-// * `requestAnimationFrame`, driven by the host frame clock.
 (() => {
   "use strict";
 
@@ -195,20 +188,12 @@
 
   globalThis.setTimeout = (callback, delay = 0, ...args) => {
     const fn = normalizeTimerCallback(callback);
-    return __widjet_set_timeout(
-      () => fn(...args),
-      Number(delay),
-      false,
-    );
+    return __widjet_set_timeout(() => fn(...args), Number(delay), false);
   };
 
   globalThis.setInterval = (callback, delay = 0, ...args) => {
     const fn = normalizeTimerCallback(callback);
-    return __widjet_set_timeout(
-      () => fn(...args),
-      Number(delay),
-      true,
-    );
+    return __widjet_set_timeout(() => fn(...args), Number(delay), true);
   };
 
   function clearTimer(id) {
@@ -230,40 +215,84 @@
     now: () => __widjet_now(),
   };
 
-  // requestAnimationFrame is driven by the host. The host only blocks on a
-  // timer while at least one callback is pending.
+  // Each WidgetCanvas owns an independent animation queue. The queue is held
+  // in a WeakMap keyed by the JS object, not another WidgetId-keyed registry.
+  // `widgets` above remains the single ID -> JS target index needed by native
+  // event dispatch. Timeline 0 is the legacy global API and is timer-driven.
   let nextFrameId = 1;
-  const frames = new Map();
+  /** @type {WeakMap<WidgetCanvas, Map<number, (timestamp: number) => void>>} */
+  const surfaceFrameQueues = new WeakMap();
+  /** @type {Map<number, (timestamp: number) => void>} */
+  const globalFrameQueue = new Map();
 
-  globalThis.requestAnimationFrame = (callback) => {
+  function enqueueFrame(queue, callback) {
     if (typeof callback !== "function") {
       throw new TypeError("requestAnimationFrame expects a function");
     }
     const id = nextFrameId++;
-    frames.set(id, callback);
+    queue.set(id, callback);
     return id;
-  };
+  }
 
-  globalThis.cancelAnimationFrame = (id) => {
-    frames.delete(id);
-  };
-
-  globalThis.__widjet_has_frames = () => frames.size > 0;
-
-  globalThis.__widjet_frame = (timestamp) => {
-    const pending = Array.from(frames.keys());
+  function runFrameQueue(queue, timestamp) {
+    if (!queue || queue.size === 0) return 0;
+    // Callbacks queued by a callback belong to the next frame. A callback that
+    // has not yet run can still be cancelled by an earlier callback.
+    const pending = Array.from(queue.keys());
     for (const id of pending) {
-      const callback = frames.get(id);
-      frames.delete(id);
-      if (!callback) continue;
-
+      const callback = queue.get(id);
+      queue.delete(id);
+      if (typeof callback !== "function") continue;
       try {
         callback(timestamp);
       } catch (error) {
         console.error("error in requestAnimationFrame callback:", error);
       }
     }
-    return frames.size;
+    return queue.size;
+  }
+
+  // Compatibility path for scripts without an explicit WidgetCanvas clock.
+  globalThis.requestAnimationFrame = (callback) =>
+    enqueueFrame(globalFrameQueue, callback);
+  globalThis.cancelAnimationFrame = (id) => globalFrameQueue.delete(Number(id));
+
+  prototype.requestAnimationFrame = function (callback) {
+    if (typeof callback !== "function") {
+      throw new TypeError("requestAnimationFrame expects a function");
+    }
+    this.__ensureWidgetForAnimationFrame();
+    let queue = surfaceFrameQueues.get(this);
+    if (!queue) {
+      queue = new Map();
+      surfaceFrameQueues.set(this, queue);
+    }
+    return enqueueFrame(queue, callback);
+  };
+  prototype.cancelAnimationFrame = function (id) {
+    const queue = surfaceFrameQueues.get(this);
+    if (queue) queue.delete(Number(id));
+  };
+
+  globalThis.__widjet_has_frames = (surfaceId) => {
+    const id = Number(surfaceId);
+    if (id === 0) return globalFrameQueue.size > 0;
+    const widget = widgets.get(id);
+    return !!widget && (surfaceFrameQueues.get(widget)?.size ?? 0) > 0;
+  };
+  globalThis.__widjet_frame = (surfaceId, timestamp) => {
+    const id = Number(surfaceId);
+    if (id === 0) return runFrameQueue(globalFrameQueue, timestamp);
+    const widget = widgets.get(id);
+    return widget
+      ? runFrameQueue(surfaceFrameQueues.get(widget), timestamp)
+      : 0;
+  };
+  globalThis.__widjet_forget_widget = (surfaceId) => {
+    const id = Number(surfaceId);
+    const widget = widgets.get(id);
+    if (widget) surfaceFrameQueues.delete(widget);
+    widgets.delete(id);
   };
 
   function formatValue(value) {

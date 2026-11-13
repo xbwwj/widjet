@@ -1,4 +1,12 @@
-use std::{collections::HashMap, fs::File, os::fd::AsFd};
+use std::{
+    collections::{HashMap, VecDeque},
+    fs::File,
+    os::fd::AsFd,
+    time::Duration,
+};
+
+use calloop::EventLoop;
+use calloop_wayland_source::WaylandSource;
 
 use memmap2::{MmapMut, MmapOptions};
 use wayland_client::{
@@ -14,10 +22,9 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 };
 
 use crate::{
-    app::State,
-    bridge::{WidgetPatch, WidgetSpec},
-    canvas::{Snapshot, WidgetId},
-    task::{PointerKind, Task, TaskSource},
+    canvas::{Snapshot, WidgetId, WidgetSpec},
+    platform::{PlatformError, PlatformEvent, PlatformEventSource, PlatformHost},
+    task::PointerKind,
 };
 
 const BTN_LEFT: u32 = 0x110;
@@ -60,7 +67,7 @@ fn resolve_anchor(flags: u32, width: u32, height: u32) -> Anchor {
 }
 
 pub struct WaylandState {
-    pub qh: QueueHandle<State>,
+    pub qh: QueueHandle<WaylandState>,
     pub wl_compositor: Option<wl_compositor::WlCompositor>,
     pub wl_shm: Option<wl_shm::WlShm>,
     pub wlr_layer_shell: Option<ZwlrLayerShellV1>,
@@ -72,6 +79,7 @@ pub struct WaylandState {
     pointer_buttons: u32,
     pointer_x: f64,
     pointer_y: f64,
+    events: VecDeque<PlatformEvent>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -113,7 +121,7 @@ struct WidgetShmPool {
 impl WidgetShmPool {
     fn new(
         shm: &wl_shm::WlShm,
-        qh: &QueueHandle<State>,
+        qh: &QueueHandle<WaylandState>,
         slot_len: usize,
         slots: usize,
     ) -> Option<Self> {
@@ -154,8 +162,10 @@ impl WidgetShmPool {
         let byte_len = snapshot.size.width as usize * snapshot.size.height as usize * 4;
         let destination = &mut self.map[offset..offset + byte_len];
         for (destination, source) in destination
-            .chunks_exact_mut(4)
-            .zip(snapshot.data.chunks_exact(4))
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(snapshot.data.as_chunks::<4>().0)
         {
             destination[0] = source[2];
             destination[1] = source[1];
@@ -166,7 +176,7 @@ impl WidgetShmPool {
 
     fn create_buffer(
         &self,
-        qh: &QueueHandle<State>,
+        qh: &QueueHandle<WaylandState>,
         slot: BufferSlot,
         width: u32,
         height: u32,
@@ -201,7 +211,7 @@ impl WlWindow {
     fn prepare_pool(
         &mut self,
         shm: &wl_shm::WlShm,
-        qh: &QueueHandle<State>,
+        qh: &QueueHandle<WaylandState>,
         byte_len: usize,
     ) -> bool {
         if let Some(pool) = &self.pool {
@@ -223,7 +233,7 @@ impl WlWindow {
 }
 
 impl WaylandState {
-    pub fn new(qh: QueueHandle<State>) -> Self {
+    pub fn new(qh: QueueHandle<WaylandState>) -> Self {
         Self {
             qh,
             wl_compositor: None,
@@ -237,7 +247,45 @@ impl WaylandState {
             pointer_buttons: 0,
             pointer_x: 0.0,
             pointer_y: 0.0,
+            events: VecDeque::new(),
         }
+    }
+
+    fn take_events(&mut self) -> Vec<PlatformEvent> {
+        self.events.drain(..).collect()
+    }
+
+    fn push_pointer(
+        &mut self,
+        widget_id: WidgetId,
+        kind: PointerKind,
+        x: f64,
+        y: f64,
+        button: u32,
+        buttons: u32,
+    ) {
+        self.events.push_back(PlatformEvent::Pointer {
+            widget_id,
+            kind,
+            x,
+            y,
+            button,
+            buttons,
+        });
+    }
+
+    fn handle_configure(&mut self, widget_id: WidgetId, serial: u32, width: u32, height: u32) {
+        self.ack_configure(widget_id, serial);
+        if let Some(window) = self.windows.get_mut(&widget_id) {
+            window.configured = true;
+            window.width = width;
+            window.height = height;
+        }
+        self.events.push_back(PlatformEvent::Resized {
+            widget_id,
+            width,
+            height,
+        });
     }
 
     fn widget_for_surface(&self, surface: &wl_surface::WlSurface) -> Option<WidgetId> {
@@ -304,48 +352,38 @@ impl WaylandState {
         }
     }
 
-    pub fn mark_configured(&mut self, id: WidgetId) {
-        if let Some(window) = self.windows.get_mut(&id) {
-            window.configured = true;
-        }
-    }
-
-    pub fn has_windows(&self) -> bool {
-        !self.windows.is_empty()
-    }
-
-    pub fn has_configured_window(&self) -> bool {
-        self.windows.values().any(|window| window.configured)
-    }
-
-    pub fn has_pending_frame_callback(&self) -> bool {
+    pub fn is_widget_configured(&self, widget_id: WidgetId) -> bool {
         self.windows
-            .values()
-            .any(|window| window.frame_callback.is_some())
+            .get(&widget_id)
+            .is_some_and(|window| window.configured)
     }
 
-    /// Ask every mapped surface for the next `wl_callback.done`.
-    ///
-    /// This is used when rAF is pending but no canvas was dirty, so the normal
-    /// present path did not request a frame callback.
-    pub fn request_frame_callbacks(&mut self) {
+    pub fn has_pending_frame_callback(&self, widget_id: WidgetId) -> bool {
+        self.windows
+            .get(&widget_id)
+            .is_some_and(|window| window.frame_callback.is_some())
+    }
+
+    /// Request a frame callback for exactly one surface. Each surface has its
+    /// own compositor clock; callbacks from other surfaces must not release
+    /// this surface's requestAnimationFrame queue.
+    pub fn request_frame_callback(&mut self, widget_id: WidgetId) {
         let qh = self.qh.clone();
-        for (widget_id, window) in self.windows.iter_mut() {
-            if window.configured && window.has_buffer && window.frame_callback.is_none() {
-                window.frame_callback = Some(
-                    window
-                        .surface
-                        .frame(&qh, FrameRequest { widget: *widget_id }),
-                );
-                window.surface.commit();
-            }
+        let Some(window) = self.windows.get_mut(&widget_id) else {
+            return;
+        };
+        if window.configured && window.has_buffer && window.frame_callback.is_none() {
+            window.frame_callback = Some(
+                window
+                    .surface
+                    .frame(&qh, FrameRequest { widget: widget_id }),
+            );
+            window.surface.commit();
         }
     }
 
-    /// Drop stale frame callbacks. A later `wl_callback.done` for one of
-    /// them is ignored and must not be mistaken for the current frame.
-    pub fn reset_frame_callbacks(&mut self) {
-        for window in self.windows.values_mut() {
+    pub fn reset_frame_callback(&mut self, widget_id: WidgetId) {
+        if let Some(window) = self.windows.get_mut(&widget_id) {
             window.frame_callback = None;
         }
     }
@@ -364,41 +402,26 @@ impl WaylandState {
         matches
     }
 
-    pub fn apply_widget(&mut self, id: WidgetId, patch: &WidgetPatch) {
+    /// Apply a complete desired widget configuration. ScriptThread calls this
+    /// only when the corresponding CanvasStore revision changes.
+    pub fn update_widget(&mut self, id: WidgetId, spec: &WidgetSpec) {
         let Some(window) = self.windows.get_mut(&id) else {
             return;
         };
-        match patch {
-            WidgetPatch::SetSize { width, height } => {
-                window.width = *width;
-                window.height = *height;
-                window.layer_surface.set_size(*width, *height);
-                window
-                    .layer_surface
-                    .set_anchor(resolve_anchor(window.anchor, *width, *height));
-            }
-            WidgetPatch::SetAnchor(anchor) => {
-                window.anchor = *anchor;
-                window.layer_surface.set_anchor(resolve_anchor(
-                    *anchor,
-                    window.width,
-                    window.height,
-                ));
-            }
-            WidgetPatch::SetExclusiveZone(zone) => {
-                window.layer_surface.set_exclusive_zone(*zone);
-            }
-            WidgetPatch::SetMargin {
-                top,
-                right,
-                bottom,
-                left,
-            } => {
-                window
-                    .layer_surface
-                    .set_margin(*top, *right, *bottom, *left);
-            }
-        }
+        window.width = spec.width;
+        window.height = spec.height;
+        window.anchor = spec.anchor;
+        window.layer_surface.set_size(spec.width, spec.height);
+        window
+            .layer_surface
+            .set_anchor(resolve_anchor(spec.anchor, spec.width, spec.height));
+        window.layer_surface.set_exclusive_zone(spec.exclusive_zone);
+        window.layer_surface.set_margin(
+            spec.margin_top,
+            spec.margin_right,
+            spec.margin_bottom,
+            spec.margin_left,
+        );
         window.surface.commit();
     }
 
@@ -465,7 +488,93 @@ impl WaylandState {
     }
 }
 
-impl Dispatch<wl_registry::WlRegistry, ()> for State {
+/// Wayland implementation of the platform event source and surface host.
+pub struct WaylandPlatform {
+    event_loop: EventLoop<'static, WaylandState>,
+    state: WaylandState,
+}
+
+impl WaylandPlatform {
+    pub fn new() -> Result<Self, PlatformError> {
+        let connection = Connection::connect_to_env().map_err(|error| {
+            PlatformError::new(format!("failed to connect to Wayland: {error}"))
+        })?;
+        let mut event_queue = connection.new_event_queue::<WaylandState>();
+        let qh = event_queue.handle();
+        let mut state = WaylandState::new(qh);
+
+        connection.display().get_registry(&state.qh, ());
+        event_queue.roundtrip(&mut state).map_err(|error| {
+            PlatformError::new(format!("Wayland registry roundtrip failed: {error:?}"))
+        })?;
+
+        if state.wl_compositor.is_none()
+            || state.wl_shm.is_none()
+            || state.wlr_layer_shell.is_none()
+        {
+            return Err(PlatformError::new(
+                "Wayland compositor, wl_shm, or zwlr_layer_shell_v1 is unavailable",
+            ));
+        }
+
+        let event_loop: EventLoop<'static, WaylandState> =
+            EventLoop::try_new().map_err(|error| {
+                PlatformError::new(format!("failed to create event loop: {error:?}"))
+            })?;
+        WaylandSource::new(connection, event_queue)
+            .insert(event_loop.handle())
+            .map_err(|error| {
+                PlatformError::new(format!("failed to register Wayland source: {error:?}"))
+            })?;
+
+        Ok(Self { event_loop, state })
+    }
+}
+
+impl PlatformEventSource for WaylandPlatform {
+    fn dispatch(&mut self, timeout: Option<Duration>) -> Result<Vec<PlatformEvent>, PlatformError> {
+        self.event_loop
+            .dispatch(timeout, &mut self.state)
+            .map_err(|error| PlatformError::new(format!("Wayland dispatch failed: {error:?}")))?;
+        Ok(self.state.take_events())
+    }
+}
+
+impl PlatformHost for WaylandPlatform {
+    fn create_widget(&mut self, widget_id: WidgetId, spec: &WidgetSpec) {
+        self.state.create_widget(widget_id, spec);
+    }
+
+    fn destroy_widget(&mut self, widget_id: WidgetId) {
+        self.state.destroy_widget(widget_id);
+    }
+
+    fn update_widget(&mut self, widget_id: WidgetId, spec: &WidgetSpec) {
+        self.state.update_widget(widget_id, spec);
+    }
+
+    fn present(&mut self, widget_id: WidgetId, snapshot: &Snapshot, wants_frame: bool) -> bool {
+        self.state.present(widget_id, snapshot, wants_frame)
+    }
+
+    fn is_widget_configured(&self, widget_id: WidgetId) -> bool {
+        self.state.is_widget_configured(widget_id)
+    }
+
+    fn has_pending_frame_callback(&self, widget_id: WidgetId) -> bool {
+        self.state.has_pending_frame_callback(widget_id)
+    }
+
+    fn request_frame_callback(&mut self, widget_id: WidgetId) {
+        self.state.request_frame_callback(widget_id);
+    }
+
+    fn reset_frame_callback(&mut self, widget_id: WidgetId) {
+        self.state.reset_frame_callback(widget_id);
+    }
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
     fn event(
         state: &mut Self,
         registry: &wl_registry::WlRegistry,
@@ -485,19 +594,19 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
 
         match interface.as_str() {
             "wl_compositor" => {
-                state.wayland.wl_compositor = Some(registry.bind(name, version.min(6), qh, ()))
+                state.wl_compositor = Some(registry.bind(name, version.min(6), qh, ()))
             }
-            "wl_shm" => state.wayland.wl_shm = Some(registry.bind(name, version.min(1), qh, ())),
+            "wl_shm" => state.wl_shm = Some(registry.bind(name, version.min(1), qh, ())),
             "zwlr_layer_shell_v1" => {
-                state.wayland.wlr_layer_shell = Some(registry.bind(name, version.min(5), qh, ()))
+                state.wlr_layer_shell = Some(registry.bind(name, version.min(5), qh, ()))
             }
-            "wl_seat" => state.wayland.wl_seat = Some(registry.bind(name, version.min(7), qh, ())),
+            "wl_seat" => state.wl_seat = Some(registry.bind(name, version.min(7), qh, ())),
             _ => {}
         }
     }
 }
 
-impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, WidgetId> for State {
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, WidgetId> for WaylandState {
     fn event(
         state: &mut Self,
         _: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
@@ -511,18 +620,19 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, WidgetId> for State {
                 serial,
                 width,
                 height,
-            } => {
-                state.handle_configure(*widget_id, serial, width, height);
-            }
+            } => state.handle_configure(*widget_id, serial, width, height),
             zwlr_layer_surface_v1::Event::Closed => {
-                state.handle_closed(*widget_id);
+                state.destroy_widget(*widget_id);
+                state.events.push_back(PlatformEvent::Closed {
+                    widget_id: *widget_id,
+                });
             }
             _ => {}
         }
     }
 }
 
-impl Dispatch<wl_callback::WlCallback, FrameRequest> for State {
+impl Dispatch<wl_callback::WlCallback, FrameRequest> for WaylandState {
     fn event(
         state: &mut Self,
         callback: &wl_callback::WlCallback,
@@ -532,14 +642,16 @@ impl Dispatch<wl_callback::WlCallback, FrameRequest> for State {
         _: &QueueHandle<Self>,
     ) {
         if let wl_callback::Event::Done { .. } = event
-            && state.wayland.frame_done(data.widget, callback)
+            && state.frame_done(data.widget, callback)
         {
-            state.queue_task(TaskSource::Rendering, Task::AnimationFrame);
+            state.events.push_back(PlatformEvent::FrameReady {
+                widget_id: data.widget,
+            });
         }
     }
 }
 
-impl Dispatch<wl_shm::WlShm, ()> for State {
+impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
     fn event(
         _: &mut Self,
         _: &wl_shm::WlShm,
@@ -552,7 +664,7 @@ impl Dispatch<wl_shm::WlShm, ()> for State {
     }
 }
 
-impl Dispatch<wl_shm_pool::WlShmPool, ()> for State {
+impl Dispatch<wl_shm_pool::WlShmPool, ()> for WaylandState {
     fn event(
         _: &mut Self,
         _: &wl_shm_pool::WlShmPool,
@@ -564,7 +676,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, ()> for State {
     }
 }
 
-impl Dispatch<wl_buffer::WlBuffer, BufferSlot> for State {
+impl Dispatch<wl_buffer::WlBuffer, BufferSlot> for WaylandState {
     fn event(
         state: &mut Self,
         buffer: &wl_buffer::WlBuffer,
@@ -574,12 +686,12 @@ impl Dispatch<wl_buffer::WlBuffer, BufferSlot> for State {
         _: &QueueHandle<Self>,
     ) {
         if let wl_buffer::Event::Release = event {
-            state.wayland.release_buffer(*slot, buffer);
+            state.release_buffer(*slot, buffer);
         }
     }
 }
 
-impl Dispatch<wl_surface::WlSurface, WidgetId> for State {
+impl Dispatch<wl_surface::WlSurface, WidgetId> for WaylandState {
     fn event(
         _: &mut Self,
         _: &wl_surface::WlSurface,
@@ -591,10 +703,10 @@ impl Dispatch<wl_surface::WlSurface, WidgetId> for State {
     }
 }
 
-delegate_noop!(State: ignore wl_compositor::WlCompositor);
-delegate_noop!(State: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
+delegate_noop!(WaylandState: ignore wl_compositor::WlCompositor);
+delegate_noop!(WaylandState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 
-impl Dispatch<wl_seat::WlSeat, ()> for State {
+impl Dispatch<wl_seat::WlSeat, ()> for WaylandState {
     fn event(
         state: &mut Self,
         seat: &wl_seat::WlSeat,
@@ -611,16 +723,16 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
         };
 
         if capabilities.contains(wl_seat::Capability::Pointer) {
-            if state.wayland.wl_pointer.is_none() {
-                state.wayland.wl_pointer = Some(seat.get_pointer(qh, ()));
+            if state.wl_pointer.is_none() {
+                state.wl_pointer = Some(seat.get_pointer(qh, ()));
             }
-        } else if let Some(pointer) = state.wayland.wl_pointer.take() {
+        } else if let Some(pointer) = state.wl_pointer.take() {
             pointer.release();
         }
     }
 }
 
-impl Dispatch<wl_pointer::WlPointer, ()> for State {
+impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
     fn event(
         state: &mut Self,
         _: &wl_pointer::WlPointer,
@@ -636,60 +748,49 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 surface_y,
                 ..
             } => {
-                let widget_id = state.wayland.widget_for_surface(&surface);
-                state.wayland.pointer_focus = widget_id;
-                state.wayland.pointer_x = surface_x;
-                state.wayland.pointer_y = surface_y;
-
+                let widget_id = state.widget_for_surface(&surface);
+                state.pointer_focus = widget_id;
+                state.pointer_x = surface_x;
+                state.pointer_y = surface_y;
                 if let Some(widget_id) = widget_id {
-                    state.queue_task(
-                        TaskSource::UserInteraction,
-                        Task::Pointer {
-                            widget_id,
-                            kind: PointerKind::Enter,
-                            x: surface_x,
-                            y: surface_y,
-                            button: 0,
-                            buttons: state.wayland.pointer_buttons,
-                        },
+                    state.push_pointer(
+                        widget_id,
+                        PointerKind::Enter,
+                        surface_x,
+                        surface_y,
+                        0,
+                        state.pointer_buttons,
                     );
                 }
             }
             wl_pointer::Event::Leave { .. } => {
-                if let Some(widget_id) = state.wayland.pointer_focus.take() {
-                    state.queue_task(
-                        TaskSource::UserInteraction,
-                        Task::Pointer {
-                            widget_id,
-                            kind: PointerKind::Leave,
-                            x: state.wayland.pointer_x,
-                            y: state.wayland.pointer_y,
-                            button: 0,
-                            buttons: state.wayland.pointer_buttons,
-                        },
+                if let Some(widget_id) = state.pointer_focus.take() {
+                    state.push_pointer(
+                        widget_id,
+                        PointerKind::Leave,
+                        state.pointer_x,
+                        state.pointer_y,
+                        0,
+                        state.pointer_buttons,
                     );
                 }
-                state.wayland.pointer_pressed = None;
+                state.pointer_pressed = None;
             }
             wl_pointer::Event::Motion {
                 surface_x,
                 surface_y,
                 ..
             } => {
-                state.wayland.pointer_x = surface_x;
-                state.wayland.pointer_y = surface_y;
-
-                if let Some(widget_id) = state.wayland.pointer_focus {
-                    state.queue_task(
-                        TaskSource::UserInteraction,
-                        Task::Pointer {
-                            widget_id,
-                            kind: PointerKind::Move,
-                            x: surface_x,
-                            y: surface_y,
-                            button: 0,
-                            buttons: state.wayland.pointer_buttons,
-                        },
+                state.pointer_x = surface_x;
+                state.pointer_y = surface_y;
+                if let Some(widget_id) = state.pointer_focus {
+                    state.push_pointer(
+                        widget_id,
+                        PointerKind::Move,
+                        surface_x,
+                        surface_y,
+                        0,
+                        state.pointer_buttons,
                     );
                 }
             }
@@ -698,7 +799,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state: button_state,
                 ..
             } => {
-                let Some(widget_id) = state.wayland.pointer_focus else {
+                let Some(widget_id) = state.pointer_focus else {
                     return;
                 };
 
@@ -711,65 +812,52 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
 
                 match button_state {
                     WEnum::Value(wl_pointer::ButtonState::Pressed) => {
-                        state.wayland.pointer_buttons |= mask;
-                        state.queue_task(
-                            TaskSource::UserInteraction,
-                            Task::Pointer {
-                                widget_id,
-                                kind: PointerKind::Down,
-                                x: state.wayland.pointer_x,
-                                y: state.wayland.pointer_y,
-                                button: dom_button,
-                                buttons: state.wayland.pointer_buttons,
-                            },
+                        state.pointer_buttons |= mask;
+                        state.push_pointer(
+                            widget_id,
+                            PointerKind::Down,
+                            state.pointer_x,
+                            state.pointer_y,
+                            dom_button,
+                            state.pointer_buttons,
                         );
 
                         if dom_button == 0 {
-                            state.wayland.pointer_pressed = Some(widget_id);
+                            state.pointer_pressed = Some(widget_id);
                         } else if dom_button == 2 {
-                            state.queue_task(
-                                TaskSource::UserInteraction,
-                                Task::Pointer {
-                                    widget_id,
-                                    kind: PointerKind::ContextMenu,
-                                    x: state.wayland.pointer_x,
-                                    y: state.wayland.pointer_y,
-                                    button: dom_button,
-                                    buttons: state.wayland.pointer_buttons,
-                                },
+                            state.push_pointer(
+                                widget_id,
+                                PointerKind::ContextMenu,
+                                state.pointer_x,
+                                state.pointer_y,
+                                dom_button,
+                                state.pointer_buttons,
                             );
                         }
                     }
                     WEnum::Value(wl_pointer::ButtonState::Released) => {
-                        state.wayland.pointer_buttons &= !mask;
-                        state.queue_task(
-                            TaskSource::UserInteraction,
-                            Task::Pointer {
-                                widget_id,
-                                kind: PointerKind::Up,
-                                x: state.wayland.pointer_x,
-                                y: state.wayland.pointer_y,
-                                button: dom_button,
-                                buttons: state.wayland.pointer_buttons,
-                            },
+                        state.pointer_buttons &= !mask;
+                        state.push_pointer(
+                            widget_id,
+                            PointerKind::Up,
+                            state.pointer_x,
+                            state.pointer_y,
+                            dom_button,
+                            state.pointer_buttons,
                         );
 
-                        if dom_button == 0 && state.wayland.pointer_pressed == Some(widget_id) {
-                            state.queue_task(
-                                TaskSource::UserInteraction,
-                                Task::Pointer {
-                                    widget_id,
-                                    kind: PointerKind::Click,
-                                    x: state.wayland.pointer_x,
-                                    y: state.wayland.pointer_y,
-                                    button: dom_button,
-                                    buttons: state.wayland.pointer_buttons,
-                                },
+                        if dom_button == 0 && state.pointer_pressed == Some(widget_id) {
+                            state.push_pointer(
+                                widget_id,
+                                PointerKind::Click,
+                                state.pointer_x,
+                                state.pointer_y,
+                                dom_button,
+                                state.pointer_buttons,
                             );
                         }
-
                         if dom_button == 0 {
-                            state.wayland.pointer_pressed = None;
+                            state.pointer_pressed = None;
                         }
                     }
                     _ => {}

@@ -2,12 +2,12 @@ use std::{fs, path::PathBuf, process::ExitCode};
 
 use clap::Parser;
 
-use crate::app::App;
+use crate::{script_thread::ScriptThread, wayland::WaylandPlatform};
 
-mod app;
-mod bridge;
 mod canvas;
 mod js;
+mod platform;
+mod script_thread;
 mod task;
 mod wayland;
 
@@ -30,7 +30,19 @@ fn main() -> ExitCode {
         }
     };
 
-    App::new().run(&js);
+    let platform = match WaylandPlatform::new() {
+        Ok(platform) => platform,
+        Err(error) => {
+            eprintln!("widjet: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    ExitCode::SUCCESS
+    match ScriptThread::new(platform).run(&js) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("widjet: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }

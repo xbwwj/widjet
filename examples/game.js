@@ -366,7 +366,7 @@ function frame(timestamp) {
   drawScoreStrip();
   if (gameOver) drawGameOver();
 
-  requestAnimationFrame(frame);
+  canvas.requestAnimationFrame(frame);
 }
 
 // ---------------------------------------------------------------------------
@@ -416,4 +416,5 @@ canvas.onresize = () => {
   // The game uses a fixed logical resolution; nothing to recompute.
 };
 
-requestAnimationFrame(frame);
+canvas.requestAnimationFrame(frame);
+

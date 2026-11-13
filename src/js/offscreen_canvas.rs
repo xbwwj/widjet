@@ -5,10 +5,7 @@ use std::{
 
 use rquickjs::{Class, Ctx, Exception, JsLifetime, class::Trace};
 
-use crate::{
-    bridge::{BridgeCommand, JsBridge, WidgetPatch},
-    canvas::{CanvasId, CanvasOwner, SharedCanvasStore, Size, WidgetId},
-};
+use crate::canvas::{CanvasId, CanvasOwner, CanvasStore, Size, WidgetId, WidgetStore};
 
 use super::{JsRuntimeData, context_2d::CanvasRenderingContext2D, image_bitmap::ImageBitmap};
 
@@ -20,8 +17,8 @@ pub struct OffscreenCanvas<'js> {
     width: Cell<u32>,
     height: Cell<u32>,
     placeholder: Option<WidgetId>,
-    canvases: SharedCanvasStore,
-    bridge: Rc<RefCell<JsBridge>>,
+    canvases: Rc<RefCell<CanvasStore>>,
+    widgets: Rc<RefCell<WidgetStore>>,
     context: Option<Class<'js, CanvasRenderingContext2D>>,
 }
 
@@ -39,18 +36,11 @@ impl<'js> OffscreenCanvas<'js> {
             ));
         };
         let canvases = data.canvases.clone();
-        let bridge = data.bridge.clone();
+        let widgets = data.widgets.clone();
         let size = Size::new(width, height);
         let canvas_id = canvases
             .borrow_mut()
             .create(size, CanvasOwner::Offscreen { placeholder });
-
-        if let Some(widget_id) = placeholder {
-            bridge.borrow().push(BridgeCommand::UpdateWidget {
-                widget_id,
-                patch: WidgetPatch::SetSize { width, height },
-            });
-        }
 
         Class::instance(
             ctx.clone(),
@@ -60,7 +50,7 @@ impl<'js> OffscreenCanvas<'js> {
                 height: Cell::new(height),
                 placeholder,
                 canvases,
-                bridge,
+                widgets,
                 context: None,
             },
         )
@@ -87,10 +77,9 @@ impl<'js> OffscreenCanvas<'js> {
             .borrow_mut()
             .recreate(self.canvas_id, Size::new(width, height));
         if let Some(widget_id) = self.placeholder {
-            self.bridge.borrow().push(BridgeCommand::UpdateWidget {
-                widget_id,
-                patch: WidgetPatch::SetSize { width, height },
-            });
+            self.widgets
+                .borrow_mut()
+                .set_size(widget_id, Size::new(width, height));
         }
     }
 }
@@ -106,7 +95,7 @@ impl<'js> OffscreenCanvas<'js> {
             ));
         };
         let canvases = data.canvases.clone();
-        let bridge = data.bridge.clone();
+        let widgets = data.widgets.clone();
         let canvas_id = canvases.borrow_mut().create(
             Size::new(width, height),
             CanvasOwner::Offscreen { placeholder: None },
@@ -117,7 +106,7 @@ impl<'js> OffscreenCanvas<'js> {
             height: Cell::new(height),
             placeholder: None,
             canvases,
-            bridge,
+            widgets,
             context: None,
         })
     }

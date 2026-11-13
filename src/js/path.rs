@@ -1,10 +1,7 @@
 use vello_cpu::kurbo::{Arc, BezPath, PathEl, Point, RoundedRect, Shape, Vec2};
 
 fn ensure_subpath(path: &mut BezPath, x: f64, y: f64) {
-    let needs_subpath = match path.elements().last() {
-        None | Some(PathEl::ClosePath) => true,
-        _ => false,
-    };
+    let needs_subpath = matches!(path.elements().last(), None | Some(PathEl::ClosePath));
     if needs_subpath {
         path.move_to((x, y));
     }
@@ -24,10 +21,7 @@ pub fn line_to(path: &mut BezPath, x: f64, y: f64) {
     if !x.is_finite() || !y.is_finite() {
         return;
     }
-    let needs_move = match path.elements().last() {
-        None | Some(PathEl::ClosePath) => true,
-        _ => false,
-    };
+    let needs_move = matches!(path.elements().last(), None | Some(PathEl::ClosePath));
     if needs_move {
         path.move_to((x, y));
     } else {

@@ -4,16 +4,19 @@
 //!
 //! * a JS object owns a [`CanvasId`], never pixels or a platform surface;
 //! * [`CanvasStore`] maps [`CanvasId`] to a [`target::CanvasTarget`];
+//! * [`WidgetStore`] is the single WidgetId-keyed surface/scheduler registry;
 //! * drawing commands are plain data ([`command::CanvasCommand`]);
-//! * the app presents dirty canvases at frame boundaries.
+//! * `ScriptThread` presents dirty canvases at frame boundaries.
 
 pub mod command;
 pub mod state;
 pub mod store;
 pub mod target;
+pub mod widget;
 
 pub use command::{CanvasCommand, FillRule, ImageSource};
-pub use store::{CanvasStore, SharedCanvasStore};
+pub use store::CanvasStore;
+pub use widget::{WidgetState, WidgetStore};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TextAlign {
@@ -53,6 +56,21 @@ pub struct TextMetrics {
 }
 
 pub type WidgetId = u32;
+
+/// Desired native-surface configuration shared by the JS canvas object and
+/// ScriptThread. This is state, not a queued platform command: ScriptThread
+/// reconciles revisions through the `PlatformHost` trait.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WidgetSpec {
+    pub width: u32,
+    pub height: u32,
+    pub anchor: u32,
+    pub exclusive_zone: i32,
+    pub margin_top: i32,
+    pub margin_right: i32,
+    pub margin_bottom: i32,
+    pub margin_left: i32,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CanvasId(pub u64);
@@ -175,7 +193,7 @@ impl Snapshot {
     /// `ImageData.data`.
     pub fn to_unpremultiplied(&self) -> Vec<u8> {
         let mut output = Vec::with_capacity(self.data.len());
-        for pixel in self.data.chunks_exact(4) {
+        for pixel in self.data.as_chunks::<4>().0 {
             let alpha = pixel[3];
             if alpha == 0 {
                 output.extend_from_slice(&[0, 0, 0, 0]);

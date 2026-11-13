@@ -112,7 +112,7 @@ function drawShape(timestamp) {
   shapeCtx.closePath();
   shapeCtx.fill();
 
-  requestAnimationFrame(drawShape);
+  shapeCanvas.requestAnimationFrame(drawShape);
 }
 
 // ---------------------------------------------------------------------------
@@ -150,4 +150,5 @@ shapeCanvas.addEventListener("contextmenu", handleContextMenu);
 shapeCanvas.addEventListener("click", handleClickListener);
 shapeCanvas.onresize = handleShapeResize;
 
-requestAnimationFrame(drawShape);
+shapeCanvas.requestAnimationFrame(drawShape);
+

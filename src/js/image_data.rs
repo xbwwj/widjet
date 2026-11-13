@@ -47,7 +47,7 @@ impl ImageData {
     /// snapshot format used by the canvas backend.
     pub fn to_snapshot(&self) -> Snapshot {
         let mut data = Vec::with_capacity(self.data.len());
-        for pixel in self.data.chunks_exact(4) {
+        for pixel in self.data.as_chunks::<4>().0 {
             let alpha = u16::from(pixel[3]);
             let premultiply =
                 |component: u8| ((u16::from(component) * alpha + 127) / 255).min(255) as u8;

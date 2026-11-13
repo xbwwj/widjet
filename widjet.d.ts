@@ -21,6 +21,10 @@ declare class WidgetCanvas {
   onpointerdown: ((event: WidgetEvent) => void) | null;
   onpointerup: ((event: WidgetEvent) => void) | null;
 
+  /** Schedule a callback on this surface's compositor frame clock. */
+  requestAnimationFrame(callback: (timestamp: number) => void): number;
+  cancelAnimationFrame(handle: number): void;
+
   addEventListener(
     type: string,
     listener: (event: WidgetEvent) => void,
@@ -76,6 +80,7 @@ interface WidgetEventInit {
   timeStamp: number;
 }
 
+/** Timer-driven compatibility timeline; prefer canvas.requestAnimationFrame. */
 declare function requestAnimationFrame(
   callback: (timestamp: number) => void,
 ): number;
@@ -252,3 +257,4 @@ declare var console: {
   warn(...data: unknown[]): void;
   error(...data: unknown[]): void;
 };
+

@@ -1,11 +1,9 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use super::{
     CanvasCommand, CanvasId, CanvasOwner, ImageSource, Size, Snapshot, TextMetrics, WidgetId,
     target::{CanvasTarget, VelloCpuTarget},
 };
-
-pub type SharedCanvasStore = Rc<RefCell<CanvasStore>>;
 
 pub struct CanvasEntry {
     pub id: CanvasId,
@@ -17,10 +15,8 @@ pub struct CanvasEntry {
     pub origin_clean: bool,
 }
 
-/// In-process equivalent of Servo's canvas paint thread map.
-///
-/// It is deliberately a narrow shared subsystem: JS can send commands and read
-/// snapshots by `CanvasId`, but it never sees app state or platform objects.
+/// CanvasId-keyed pixel/resource storage. Widget lifecycle and scheduling state
+/// live in the separate shared `WidgetStore`, so this map has no WidgetId keys.
 pub struct CanvasStore {
     next_id: u64,
     canvases: HashMap<CanvasId, CanvasEntry>,

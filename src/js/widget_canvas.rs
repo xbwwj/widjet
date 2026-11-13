@@ -1,70 +1,60 @@
-use std::{cell::Cell, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
 
 use rquickjs::{Class, Ctx, Exception, JsLifetime, class::Trace};
 
-use crate::{
-    bridge::{BridgeCommand, JsBridge, WidgetPatch, WidgetSpec},
-    canvas::{CanvasId, CanvasOwner, SharedCanvasStore, Size, WidgetId},
-};
+use crate::canvas::{CanvasId, CanvasOwner, CanvasStore, Size, WidgetId, WidgetSpec, WidgetStore};
 
 use super::{
     JsRuntimeData, context_2d::CanvasRenderingContext2D, offscreen_canvas::OffscreenCanvas,
 };
 
-/// The onscreen canvas / widget surface exposed to JS.
-///
-/// It is a JS facade only: no `wl_surface`, no `wl_shm_pool`, no app `State`.
-/// Platform work is deferred through [`JsBridge`].
+/// JS facade for one widget surface. All WidgetId-keyed state lives in the
+/// shared WidgetStore; this object retains only its identity and canvas refs.
 #[derive(JsLifetime)]
 #[rquickjs::class(rename_all = "camelCase")]
 pub struct WidgetCanvas<'js> {
     widget_id: WidgetId,
-    width: Cell<u32>,
-    height: Cell<u32>,
-    anchor: Cell<u32>,
-    exclusive_zone: Cell<i32>,
-    margins: Cell<(i32, i32, i32, i32)>,
-    canvases: SharedCanvasStore,
-    bridge: Rc<std::cell::RefCell<JsBridge>>,
-    created: Cell<bool>,
+    canvases: Rc<RefCell<CanvasStore>>,
+    widgets: Rc<RefCell<WidgetStore>>,
     canvas_id: Option<CanvasId>,
     placeholder: Option<CanvasId>,
     context: Option<Class<'js, CanvasRenderingContext2D>>,
 }
 
 impl<'js> WidgetCanvas<'js> {
-    fn send_patch(&self, patch: WidgetPatch) {
-        self.bridge.borrow().push(BridgeCommand::UpdateWidget {
-            widget_id: self.widget_id,
-            patch,
-        });
+    fn size(&self) -> Size {
+        self.widgets
+            .borrow()
+            .get(self.widget_id)
+            .map(|state| state.size)
+            .unwrap_or_default()
     }
 
-    /// Create the platform surface lazily with the final initial size.
-    ///
-    /// Scripts commonly set `width`/`height` before calling `getContext()`.
-    /// Deferring widget creation until the first canvas operation avoids a
-    /// transient fullscreen layer surface configured from the default 0x0
-    /// size.
-    fn ensure_widget(&self) {
-        if self.created.replace(true) {
-            return;
-        }
+    fn spec(&self) -> WidgetSpec {
+        self.widgets
+            .borrow()
+            .get(self.widget_id)
+            .map(|state| state.spec)
+            .unwrap_or_default()
+    }
 
-        let (top, right, bottom, left) = self.margins.get();
-        self.bridge.borrow().push(BridgeCommand::CreateWidget {
-            widget_id: self.widget_id,
-            spec: WidgetSpec {
-                width: self.width.get(),
-                height: self.height.get(),
-                anchor: self.anchor.get(),
-                exclusive_zone: self.exclusive_zone.get(),
-                margin_top: top,
-                margin_right: right,
-                margin_bottom: bottom,
-                margin_left: left,
-            },
-        });
+    fn update_spec(&self, update: impl FnOnce(&mut WidgetSpec)) {
+        self.widgets
+            .borrow_mut()
+            .update_spec(self.widget_id, update);
+    }
+
+    /// Mark the model entry as requiring a native surface. ScriptThread will
+    /// materialize it on the next model-reconciliation step.
+    fn ensure_widget(&self) {
+        self.widgets.borrow_mut().mark_materialized(self.widget_id);
+    }
+
+    fn set_size(&self, size: Size) {
+        self.widgets.borrow_mut().set_size(self.widget_id, size);
+        if let Some(canvas_id) = self.canvas_id {
+            self.canvases.borrow_mut().recreate(canvas_id, size);
+        }
     }
 
     fn ensure_canvas(&mut self) -> CanvasId {
@@ -72,8 +62,9 @@ impl<'js> WidgetCanvas<'js> {
             return canvas_id;
         }
         self.ensure_widget();
+        let size = self.size();
         let canvas_id = self.canvases.borrow_mut().create(
-            Size::new(self.width.get(), self.height.get()),
+            size,
             CanvasOwner::Onscreen {
                 widget: self.widget_id,
             },
@@ -83,8 +74,7 @@ impl<'js> WidgetCanvas<'js> {
     }
 
     /// The canvas behind this widget for use as a `drawImage` source.
-    ///
-    /// After `transferControlToOffscreen`, this is the offscreen canvas.
+    /// After `transferControlToOffscreen`, this is the offscreen placeholder.
     pub fn canvas_id(&self) -> Option<CanvasId> {
         self.canvas_id.or(self.placeholder)
     }
@@ -104,26 +94,21 @@ impl<'js> WidgetCanvas<'js> {
                 "WidgetCanvas used outside a widjet runtime",
             ));
         };
-        let widget_id = data.bridge.borrow().alloc_widget_id();
         let canvases = data.canvases.clone();
-        let bridge = data.bridge.clone();
-        let spec = WidgetSpec::default();
+        let widgets = data.widgets.clone();
+        let widget_id = {
+            let mut store = widgets.borrow_mut();
+            let id = store.allocate_id();
+            // Register immediately so the WidgetStore is the only authoritative
+            // WidgetId registry. `materialized=false` keeps surface creation lazy.
+            store.register(id, WidgetSpec::default());
+            id
+        };
 
         Ok(Self {
             widget_id,
-            width: Cell::new(spec.width),
-            height: Cell::new(spec.height),
-            anchor: Cell::new(spec.anchor),
-            exclusive_zone: Cell::new(spec.exclusive_zone),
-            margins: Cell::new((
-                spec.margin_top,
-                spec.margin_right,
-                spec.margin_bottom,
-                spec.margin_left,
-            )),
             canvases,
-            bridge,
-            created: Cell::new(false),
+            widgets,
             canvas_id: None,
             placeholder: None,
             context: None,
@@ -135,19 +120,25 @@ impl<'js> WidgetCanvas<'js> {
         self.widget_id
     }
 
-    /// Update the cached size after a compositor configure event.
-    ///
-    /// This must not issue another resize request; the caller is reacting to
-    /// the compositor, not driving it.
+    /// Materialize this surface when its first surface-bound rAF is requested.
+    #[qjs(rename = "__ensureWidgetForAnimationFrame")]
+    fn ensure_widget_for_animation_frame(&self) {
+        self.ensure_widget();
+    }
+
+    /// Synchronize the JS-visible size after the compositor configure event.
+    /// The requested WidgetSpec is intentionally left unchanged here.
     #[qjs(rename = "__setSize")]
     fn set_platform_size(&self, width: u32, height: u32) {
-        self.width.set(width);
-        self.height.set(height);
+        let size = Size::new(width, height);
+        self.widgets
+            .borrow_mut()
+            .update_runtime(self.widget_id, |state| state.size = size);
     }
 
     #[qjs(get, rename = "width")]
     fn width(&self) -> u32 {
-        self.width.get()
+        self.size().width
     }
 
     #[qjs(set, rename = "width")]
@@ -155,23 +146,14 @@ impl<'js> WidgetCanvas<'js> {
         if self.placeholder.is_some() {
             return;
         }
-        self.width.set(width);
-        if let Some(canvas_id) = self.canvas_id {
-            self.canvases
-                .borrow_mut()
-                .recreate(canvas_id, Size::new(width, self.height.get()));
-        }
-        if self.created.get() {
-            self.send_patch(WidgetPatch::SetSize {
-                width,
-                height: self.height.get(),
-            });
-        }
+        let mut size = self.size();
+        size.width = width;
+        self.set_size(size);
     }
 
     #[qjs(get, rename = "height")]
     fn height(&self) -> u32 {
-        self.height.get()
+        self.size().height
     }
 
     #[qjs(set, rename = "height")]
@@ -179,92 +161,69 @@ impl<'js> WidgetCanvas<'js> {
         if self.placeholder.is_some() {
             return;
         }
-        self.height.set(height);
-        if let Some(canvas_id) = self.canvas_id {
-            self.canvases
-                .borrow_mut()
-                .recreate(canvas_id, Size::new(self.width.get(), height));
-        }
-        if self.created.get() {
-            self.send_patch(WidgetPatch::SetSize {
-                width: self.width.get(),
-                height,
-            });
-        }
+        let mut size = self.size();
+        size.height = height;
+        self.set_size(size);
     }
 
     #[qjs(get, rename = "anchor")]
     fn anchor(&self) -> u32 {
-        self.anchor.get()
+        self.spec().anchor
     }
 
     #[qjs(set, rename = "anchor")]
     fn set_anchor(&self, value: u32) {
-        self.anchor.set(value);
-        if self.created.get() {
-            self.send_patch(WidgetPatch::SetAnchor(value));
-        }
+        self.update_spec(|spec| spec.anchor = value);
     }
 
     #[qjs(get, rename = "exclusiveZone")]
     fn exclusive_zone(&self) -> i32 {
-        self.exclusive_zone.get()
+        self.spec().exclusive_zone
     }
 
     #[qjs(set, rename = "exclusiveZone")]
     fn set_exclusive_zone(&self, value: i32) {
-        self.exclusive_zone.set(value);
-        if self.created.get() {
-            self.send_patch(WidgetPatch::SetExclusiveZone(value));
-        }
+        self.update_spec(|spec| spec.exclusive_zone = value);
     }
 
     #[qjs(get, rename = "marginTop")]
     fn margin_top(&self) -> i32 {
-        self.margins.get().0
+        self.spec().margin_top
     }
 
     #[qjs(set, rename = "marginTop")]
     fn set_margin_top(&self, value: i32) {
-        let (_, right, bottom, left) = self.margins.get();
-        self.margins.set((value, right, bottom, left));
-        self.send_margins();
+        self.update_spec(|spec| spec.margin_top = value);
     }
 
     #[qjs(get, rename = "marginRight")]
     fn margin_right(&self) -> i32 {
-        self.margins.get().1
+        self.spec().margin_right
     }
 
     #[qjs(set, rename = "marginRight")]
     fn set_margin_right(&self, value: i32) {
-        let (top, _, bottom, left) = self.margins.get();
-        self.margins.set((top, value, bottom, left));
-        self.send_margins();
+        self.update_spec(|spec| spec.margin_right = value);
     }
 
     #[qjs(get, rename = "marginBottom")]
     fn margin_bottom(&self) -> i32 {
-        self.margins.get().2
+        self.spec().margin_bottom
     }
 
     #[qjs(set, rename = "marginBottom")]
     fn set_margin_bottom(&self, value: i32) {
-        let (top, right, _, left) = self.margins.get();
-        self.margins.set((top, right, value, left));
-        self.send_margins();
+        self.update_spec(|spec| spec.margin_bottom = value);
     }
 
     #[qjs(get, rename = "marginLeft")]
     fn margin_left(&self) -> i32 {
-        self.margins.get().3
+        self.spec().margin_left
     }
 
     #[qjs(set, rename = "marginLeft")]
     fn set_margin_left(&self, value: i32) {
-        let (top, right, bottom, _) = self.margins.get();
-        self.margins.set((top, right, bottom, value));
-        self.send_margins();
+        self.update_spec(|spec| spec.margin_left = value);
     }
 
     fn get_context(
@@ -272,10 +231,7 @@ impl<'js> WidgetCanvas<'js> {
         ctx: Ctx<'js>,
         ty: String,
     ) -> rquickjs::Result<Option<Class<'js, CanvasRenderingContext2D>>> {
-        if ty != "2d" {
-            return Ok(None);
-        }
-        if self.placeholder.is_some() {
+        if ty != "2d" || self.placeholder.is_some() {
             return Ok(None);
         }
         if let Some(context) = &self.context {
@@ -300,10 +256,11 @@ impl<'js> WidgetCanvas<'js> {
         }
 
         self.ensure_widget();
+        let size = self.size();
         let offscreen = OffscreenCanvas::create_with_placeholder(
             &ctx,
-            self.width.get(),
-            self.height.get(),
+            size.width,
+            size.height,
             Some(self.widget_id),
         )?;
         self.placeholder = Some(offscreen.borrow().canvas_id());
@@ -318,24 +275,7 @@ impl<'js> WidgetCanvas<'js> {
             self.canvases.borrow_mut().destroy(canvas_id);
         }
         self.context = None;
-        self.bridge.borrow().push(BridgeCommand::DestroyWidget {
-            widget_id: self.widget_id,
-        });
-    }
-}
-
-impl<'js> WidgetCanvas<'js> {
-    fn send_margins(&self) {
-        if !self.created.get() {
-            return;
-        }
-        let (top, right, bottom, left) = self.margins.get();
-        self.send_patch(WidgetPatch::SetMargin {
-            top,
-            right,
-            bottom,
-            left,
-        });
+        self.widgets.borrow_mut().mark_removed(self.widget_id);
     }
 }
 

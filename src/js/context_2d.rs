@@ -1,10 +1,10 @@
-use std::{cell::RefCell, sync::Arc};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use rquickjs::{Class, Ctx, JsLifetime, Value, class::Trace, function::Opt};
 use vello_cpu::kurbo::{Affine, BezPath, Rect};
 
 use crate::canvas::{
-    CanvasCommand, CanvasId, FillRule, ImageSource, SharedCanvasStore, Size, Snapshot,
+    CanvasCommand, CanvasId, CanvasStore, FillRule, ImageSource, Size, Snapshot,
     state::{CanvasContextState, parse_color, parse_font, parse_text_align, parse_text_baseline},
 };
 
@@ -16,7 +16,7 @@ use super::{
 #[derive(JsLifetime)]
 #[rquickjs::class(rename_all = "camelCase")]
 pub struct CanvasRenderingContext2D {
-    canvases: SharedCanvasStore,
+    canvases: Rc<RefCell<CanvasStore>>,
     canvas_id: CanvasId,
     state: RefCell<CanvasContextState>,
     saved_states: RefCell<Vec<CanvasContextState>>,
@@ -26,7 +26,7 @@ pub struct CanvasRenderingContext2D {
 impl CanvasRenderingContext2D {
     pub fn create<'js>(
         ctx: &Ctx<'js>,
-        canvases: SharedCanvasStore,
+        canvases: Rc<RefCell<CanvasStore>>,
         canvas_id: CanvasId,
     ) -> rquickjs::Result<Class<'js, Self>> {
         Class::instance(
@@ -459,21 +459,21 @@ impl CanvasRenderingContext2D {
     fn translate(&self, x: f64, y: f64) {
         if x.is_finite() && y.is_finite() {
             let mut state = self.state.borrow_mut();
-            state.transform = state.transform * Affine::translate((x, y));
+            state.transform *= Affine::translate((x, y));
         }
     }
 
     fn scale(&self, x: f64, y: f64) {
         if x.is_finite() && y.is_finite() {
             let mut state = self.state.borrow_mut();
-            state.transform = state.transform * Affine::scale_non_uniform(x, y);
+            state.transform *= Affine::scale_non_uniform(x, y);
         }
     }
 
     fn rotate(&self, angle: f64) {
         if angle.is_finite() {
             let mut state = self.state.borrow_mut();
-            state.transform = state.transform * Affine::rotate(angle);
+            state.transform *= Affine::rotate(angle);
         }
     }
 
