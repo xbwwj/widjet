@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 calloop = "0.14"
 calloop-wayland-source = "0.4"
+clap = { version = "4.6.7", features = ["derive"] }
 memmap2 = "0.9"
 parley = { version = "0.12.0", features = ["complex-scripts"] }
 rquickjs = { version = "0.14", features = ["macro"] }
@@ -13,6 +14,3 @@ tempfile = "3"
 vello_cpu = { version = "0.3.0", features = ["text"] }
 wayland-client = "0.31.15"
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
-
-
-

@@ -1,50 +1,510 @@
+use std::{collections::HashMap, fs::File, os::fd::AsFd};
+
+use memmap2::{MmapMut, MmapOptions};
 use wayland_client::{
-    Connection, Dispatch, QueueHandle, delegate_noop,
+    Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop,
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm,
+        wl_shm_pool, wl_surface,
     },
 };
-use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+use wayland_protocols_wlr::layer_shell::v1::client::{
+    zwlr_layer_shell_v1::{self, Layer, ZwlrLayerShellV1},
+    zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
+};
 
-use crate::app::State;
+use crate::{
+    app::State,
+    bridge::{WidgetPatch, WidgetSpec},
+    canvas::{Snapshot, WidgetId},
+    task::{PointerKind, Task, TaskSource},
+};
+
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
+
+const ANCHOR_TOP: u32 = 0x1;
+const ANCHOR_BOTTOM: u32 = 0x2;
+const ANCHOR_LEFT: u32 = 0x4;
+const ANCHOR_RIGHT: u32 = 0x8;
+
+fn anchor_from_flags(flags: u32) -> Anchor {
+    let mut anchor = Anchor::empty();
+    if flags & ANCHOR_TOP != 0 {
+        anchor |= Anchor::Top;
+    }
+    if flags & ANCHOR_BOTTOM != 0 {
+        anchor |= Anchor::Bottom;
+    }
+    if flags & ANCHOR_LEFT != 0 {
+        anchor |= Anchor::Left;
+    }
+    if flags & ANCHOR_RIGHT != 0 {
+        anchor |= Anchor::Right;
+    }
+    anchor
+}
+
+/// A zero-sized dimension is stretched by the layer-shell protocol, which
+/// requires both opposite edges to be anchored.
+fn resolve_anchor(flags: u32, width: u32, height: u32) -> Anchor {
+    let mut anchor = anchor_from_flags(flags);
+    if width == 0 {
+        anchor |= Anchor::Left | Anchor::Right;
+    }
+    if height == 0 {
+        anchor |= Anchor::Top | Anchor::Bottom;
+    }
+    anchor
+}
+
+pub struct WaylandState {
+    pub qh: QueueHandle<State>,
+    pub wl_compositor: Option<wl_compositor::WlCompositor>,
+    pub wl_shm: Option<wl_shm::WlShm>,
+    pub wlr_layer_shell: Option<ZwlrLayerShellV1>,
+    pub wl_seat: Option<wl_seat::WlSeat>,
+    pub wl_pointer: Option<wl_pointer::WlPointer>,
+    windows: HashMap<WidgetId, WlWindow>,
+    pointer_focus: Option<WidgetId>,
+    pointer_pressed: Option<WidgetId>,
+    pointer_buttons: u32,
+    pointer_x: f64,
+    pointer_y: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrameRequest {
+    widget: WidgetId,
+}
+
+struct WlWindow {
+    surface: wl_surface::WlSurface,
+    layer_surface: ZwlrLayerSurfaceV1,
+    width: u32,
+    height: u32,
+    anchor: u32,
+    configured: bool,
+    has_buffer: bool,
+    frame_callback: Option<wl_callback::WlCallback>,
+    // One shm pool per WidgetCanvas. It is recreated only when the canvas
+    // dimensions change and no buffer is in flight, then dropped with the
+    // widget surface.
+    pool: Option<WidgetShmPool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BufferSlot {
+    widget: WidgetId,
+    offset: usize,
+}
+
+struct WidgetShmPool {
+    pool: wl_shm_pool::WlShmPool,
+    file: File,
+    map: MmapMut,
+    slot_len: usize,
+    slots: usize,
+    free: Vec<usize>,
+    in_flight: Vec<wl_buffer::WlBuffer>,
+}
+
+impl WidgetShmPool {
+    fn new(
+        shm: &wl_shm::WlShm,
+        qh: &QueueHandle<State>,
+        slot_len: usize,
+        slots: usize,
+    ) -> Option<Self> {
+        let total_len = slot_len.checked_mul(slots)?;
+        let file = tempfile::tempfile().ok()?;
+        file.set_len(total_len as u64).ok()?;
+        let map = unsafe { MmapOptions::new().len(total_len).map_mut(&file) }.ok()?;
+        let pool = shm.create_pool(file.as_fd(), total_len as i32, qh, ());
+        let free = (0..slots).rev().map(|slot| slot * slot_len).collect();
+        Some(Self {
+            pool,
+            file,
+            map,
+            slot_len,
+            slots,
+            free,
+            in_flight: Vec::new(),
+        })
+    }
+
+    fn alloc_offset(&mut self) -> Option<usize> {
+        if let Some(offset) = self.free.pop() {
+            return Some(offset);
+        }
+
+        // All slots are in flight. Grow the pool by one slot; existing buffer
+        // offsets stay valid because wl_shm_pool.resize only extends the pool.
+        let offset = self.slots.checked_mul(self.slot_len)?;
+        self.slots = self.slots.checked_add(1)?;
+        let total_len = self.slots.checked_mul(self.slot_len)?;
+        self.file.set_len(total_len as u64).ok()?;
+        self.pool.resize(total_len as i32);
+        self.map = unsafe { MmapOptions::new().len(total_len).map_mut(&self.file) }.ok()?;
+        Some(offset)
+    }
+
+    fn write_snapshot(&mut self, offset: usize, snapshot: &Snapshot) {
+        let byte_len = snapshot.size.width as usize * snapshot.size.height as usize * 4;
+        let destination = &mut self.map[offset..offset + byte_len];
+        for (destination, source) in destination
+            .chunks_exact_mut(4)
+            .zip(snapshot.data.chunks_exact(4))
+        {
+            destination[0] = source[2];
+            destination[1] = source[1];
+            destination[2] = source[0];
+            destination[3] = source[3];
+        }
+    }
+
+    fn create_buffer(
+        &self,
+        qh: &QueueHandle<State>,
+        slot: BufferSlot,
+        width: u32,
+        height: u32,
+        stride: i32,
+    ) -> wl_buffer::WlBuffer {
+        self.pool.create_buffer(
+            slot.offset as i32,
+            width as i32,
+            height as i32,
+            stride,
+            wl_shm::Format::Argb8888,
+            qh,
+            slot,
+        )
+    }
+
+    fn release(&mut self, buffer: &wl_buffer::WlBuffer, offset: usize) {
+        let released = buffer.id();
+        self.in_flight
+            .retain(|in_flight| in_flight.id() != released);
+        self.free.push(offset);
+    }
+}
+
+impl Drop for WidgetShmPool {
+    fn drop(&mut self) {
+        self.pool.destroy();
+    }
+}
+
+impl WlWindow {
+    fn prepare_pool(
+        &mut self,
+        shm: &wl_shm::WlShm,
+        qh: &QueueHandle<State>,
+        byte_len: usize,
+    ) -> bool {
+        if let Some(pool) = &self.pool {
+            if pool.slot_len == byte_len {
+                return true;
+            }
+
+            // Shrinking (or growing) changes slot offsets, so only rebuild when
+            // nothing is in flight. While waiting, reuse the old slots if they
+            // are large enough.
+            if !pool.in_flight.is_empty() {
+                return pool.slot_len >= byte_len;
+            }
+        }
+
+        self.pool = WidgetShmPool::new(shm, qh, byte_len, 4);
+        self.pool.is_some()
+    }
+}
+
+impl WaylandState {
+    pub fn new(qh: QueueHandle<State>) -> Self {
+        Self {
+            qh,
+            wl_compositor: None,
+            wl_shm: None,
+            wlr_layer_shell: None,
+            wl_seat: None,
+            wl_pointer: None,
+            windows: HashMap::new(),
+            pointer_focus: None,
+            pointer_pressed: None,
+            pointer_buttons: 0,
+            pointer_x: 0.0,
+            pointer_y: 0.0,
+        }
+    }
+
+    fn widget_for_surface(&self, surface: &wl_surface::WlSurface) -> Option<WidgetId> {
+        self.windows
+            .iter()
+            .find(|(_, window)| window.surface.id() == surface.id())
+            .map(|(widget_id, _)| *widget_id)
+    }
+
+    pub fn create_widget(&mut self, id: WidgetId, spec: &WidgetSpec) {
+        let (Some(compositor), Some(shell)) = (&self.wl_compositor, &self.wlr_layer_shell) else {
+            return;
+        };
+
+        let surface = compositor.create_surface(&self.qh, id);
+        let layer_surface = shell.get_layer_surface(
+            &surface,
+            None,
+            Layer::Top,
+            "widjet".to_string(),
+            &self.qh,
+            id,
+        );
+
+        layer_surface.set_anchor(resolve_anchor(spec.anchor, spec.width, spec.height));
+        if spec.width != 0 || spec.height != 0 {
+            layer_surface.set_size(spec.width, spec.height);
+        }
+        layer_surface.set_exclusive_zone(spec.exclusive_zone);
+        layer_surface.set_margin(
+            spec.margin_top,
+            spec.margin_right,
+            spec.margin_bottom,
+            spec.margin_left,
+        );
+        surface.commit();
+
+        self.windows.insert(
+            id,
+            WlWindow {
+                surface,
+                layer_surface,
+                width: spec.width,
+                height: spec.height,
+                anchor: spec.anchor,
+                configured: false,
+                has_buffer: false,
+                frame_callback: None,
+                pool: None,
+            },
+        );
+    }
+
+    pub fn destroy_widget(&mut self, id: WidgetId) {
+        if self.pointer_focus == Some(id) {
+            self.pointer_focus = None;
+        }
+        if self.pointer_pressed == Some(id) {
+            self.pointer_pressed = None;
+        }
+        if let Some(window) = self.windows.remove(&id) {
+            window.layer_surface.destroy();
+            window.surface.destroy();
+        }
+    }
+
+    pub fn mark_configured(&mut self, id: WidgetId) {
+        if let Some(window) = self.windows.get_mut(&id) {
+            window.configured = true;
+        }
+    }
+
+    pub fn has_windows(&self) -> bool {
+        !self.windows.is_empty()
+    }
+
+    pub fn has_configured_window(&self) -> bool {
+        self.windows.values().any(|window| window.configured)
+    }
+
+    pub fn has_pending_frame_callback(&self) -> bool {
+        self.windows
+            .values()
+            .any(|window| window.frame_callback.is_some())
+    }
+
+    /// Ask every mapped surface for the next `wl_callback.done`.
+    ///
+    /// This is used when rAF is pending but no canvas was dirty, so the normal
+    /// present path did not request a frame callback.
+    pub fn request_frame_callbacks(&mut self) {
+        let qh = self.qh.clone();
+        for (widget_id, window) in self.windows.iter_mut() {
+            if window.configured && window.has_buffer && window.frame_callback.is_none() {
+                window.frame_callback = Some(
+                    window
+                        .surface
+                        .frame(&qh, FrameRequest { widget: *widget_id }),
+                );
+                window.surface.commit();
+            }
+        }
+    }
+
+    /// Drop stale frame callbacks. A later `wl_callback.done` for one of
+    /// them is ignored and must not be mistaken for the current frame.
+    pub fn reset_frame_callbacks(&mut self) {
+        for window in self.windows.values_mut() {
+            window.frame_callback = None;
+        }
+    }
+
+    fn frame_done(&mut self, widget: WidgetId, callback: &wl_callback::WlCallback) -> bool {
+        let Some(window) = self.windows.get_mut(&widget) else {
+            return false;
+        };
+        let matches = window
+            .frame_callback
+            .as_ref()
+            .is_some_and(|in_flight| in_flight.id() == callback.id());
+        if matches {
+            window.frame_callback = None;
+        }
+        matches
+    }
+
+    pub fn apply_widget(&mut self, id: WidgetId, patch: &WidgetPatch) {
+        let Some(window) = self.windows.get_mut(&id) else {
+            return;
+        };
+        match patch {
+            WidgetPatch::SetSize { width, height } => {
+                window.width = *width;
+                window.height = *height;
+                window.layer_surface.set_size(*width, *height);
+                window
+                    .layer_surface
+                    .set_anchor(resolve_anchor(window.anchor, *width, *height));
+            }
+            WidgetPatch::SetAnchor(anchor) => {
+                window.anchor = *anchor;
+                window.layer_surface.set_anchor(resolve_anchor(
+                    *anchor,
+                    window.width,
+                    window.height,
+                ));
+            }
+            WidgetPatch::SetExclusiveZone(zone) => {
+                window.layer_surface.set_exclusive_zone(*zone);
+            }
+            WidgetPatch::SetMargin {
+                top,
+                right,
+                bottom,
+                left,
+            } => {
+                window
+                    .layer_surface
+                    .set_margin(*top, *right, *bottom, *left);
+            }
+        }
+        window.surface.commit();
+    }
+
+    pub fn ack_configure(&self, id: WidgetId, serial: u32) {
+        if let Some(window) = self.windows.get(&id) {
+            window.layer_surface.ack_configure(serial);
+            window.surface.commit();
+        }
+    }
+
+    /// Returns whether the snapshot was committed to the compositor.
+    pub fn present(&mut self, id: WidgetId, snapshot: &Snapshot, wants_frame: bool) -> bool {
+        let Some(shm) = &self.wl_shm else {
+            return false;
+        };
+        let qh = self.qh.clone();
+        let Some(window) = self.windows.get_mut(&id) else {
+            return false;
+        };
+        if !window.configured || snapshot.size.is_empty() {
+            return false;
+        }
+
+        let width = snapshot.size.width;
+        let height = snapshot.size.height;
+        let stride = width as i32 * 4;
+        let byte_len = stride as usize * height as usize;
+
+        if !window.prepare_pool(shm, &self.qh, byte_len) {
+            return false;
+        }
+        let Some(pool) = window.pool.as_mut() else {
+            return false;
+        };
+        let Some(offset) = pool.alloc_offset() else {
+            return false;
+        };
+        pool.write_snapshot(offset, snapshot);
+        let slot = BufferSlot { widget: id, offset };
+        let buffer = pool.create_buffer(&qh, slot, width, height, stride);
+
+        if wants_frame && window.frame_callback.is_none() {
+            window.frame_callback = Some(window.surface.frame(&qh, FrameRequest { widget: id }));
+        }
+
+        window.surface.attach(Some(&buffer), 0, 0);
+        window.surface.damage(0, 0, width as i32, height as i32);
+        window.surface.commit();
+        window.has_buffer = true;
+        if let Some(pool) = window.pool.as_mut() {
+            pool.in_flight.push(buffer);
+        }
+        true
+    }
+
+    fn release_buffer(&mut self, slot: BufferSlot, buffer: &wl_buffer::WlBuffer) {
+        let Some(window) = self.windows.get_mut(&slot.widget) else {
+            return;
+        };
+        if let Some(pool) = window.pool.as_mut() {
+            pool.release(buffer, slot.offset);
+        }
+        buffer.destroy();
+    }
+}
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
     fn event(
-        this: &mut Self,
+        state: &mut Self,
         registry: &wl_registry::WlRegistry,
         event: wl_registry::Event,
         _: &(),
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        match event {
-            wl_registry::Event::Global {
-                name,
-                interface,
-                version,
-            } => match interface.as_str() {
-                "wl_compositor" => {
-                    this.wl_compositor = Some(registry.bind(name, version.min(6), qh, ()))
-                }
-                "wl_shm" => this.wl_shm = Some(registry.bind(name, version.min(1), qh, ())),
-                "zwlr_layer_shell_v1" => {
-                    this.wlr_layer_shell = Some(registry.bind(name, version.min(5), qh, ()))
-                }
-                _ => {}
-            },
+        let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        else {
+            return;
+        };
+
+        match interface.as_str() {
+            "wl_compositor" => {
+                state.wayland.wl_compositor = Some(registry.bind(name, version.min(6), qh, ()))
+            }
+            "wl_shm" => state.wayland.wl_shm = Some(registry.bind(name, version.min(1), qh, ())),
+            "zwlr_layer_shell_v1" => {
+                state.wayland.wlr_layer_shell = Some(registry.bind(name, version.min(5), qh, ()))
+            }
+            "wl_seat" => state.wayland.wl_seat = Some(registry.bind(name, version.min(7), qh, ())),
             _ => {}
         }
     }
 }
 
-impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, u32> for State {
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, WidgetId> for State {
     fn event(
         state: &mut Self,
-        proxy: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        _: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
         event: zwlr_layer_surface_v1::Event,
-        canvas_id: &u32,
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        widget_id: &WidgetId,
+        _: &Connection,
+        _: &QueueHandle<Self>,
     ) {
         match event {
             zwlr_layer_surface_v1::Event::Configure {
@@ -52,70 +512,110 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, u32> for State {
                 width,
                 height,
             } => {
-                // TODO: get and resize canvas
+                state.handle_configure(*widget_id, serial, width, height);
             }
             zwlr_layer_surface_v1::Event::Closed => {
-                println!("layer surface for canvas {canvas_id} closed");
-                // TODO: should turn into js event queue
+                state.handle_closed(*widget_id);
             }
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, FrameRequest> for State {
+    fn event(
+        state: &mut Self,
+        callback: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        data: &FrameRequest,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event
+            && state.wayland.frame_done(data.widget, callback)
+        {
+            state.queue_task(TaskSource::Rendering, Task::AnimationFrame);
         }
     }
 }
 
 impl Dispatch<wl_shm::WlShm, ()> for State {
     fn event(
-        state: &mut Self,
-        proxy: &wl_shm::WlShm,
-        event: <wl_shm::WlShm as wayland_client::Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _: &mut Self,
+        _: &wl_shm::WlShm,
+        _: <wl_shm::WlShm as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
     ) {
-        match event {
-            wl_shm::Event::Format { format } => {
-                // TODO: store allowed formats
-            }
-            _ => {}
+        // TODO: record supported formats.
+    }
+}
+
+impl Dispatch<wl_shm_pool::WlShmPool, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &wl_shm_pool::WlShmPool,
+        _: <wl_shm_pool::WlShmPool as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_buffer::WlBuffer, BufferSlot> for State {
+    fn event(
+        state: &mut Self,
+        buffer: &wl_buffer::WlBuffer,
+        event: <wl_buffer::WlBuffer as Proxy>::Event,
+        slot: &BufferSlot,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_buffer::Event::Release = event {
+            state.wayland.release_buffer(*slot, buffer);
         }
     }
 }
 
-impl Dispatch<wl_buffer::WlBuffer, ()> for State {
+impl Dispatch<wl_surface::WlSurface, WidgetId> for State {
     fn event(
-        state: &mut Self,
-        proxy: &wl_buffer::WlBuffer,
-        event: <wl_buffer::WlBuffer as wayland_client::Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _: &mut Self,
+        _: &wl_surface::WlSurface,
+        _: <wl_surface::WlSurface as Proxy>::Event,
+        _: &WidgetId,
+        _: &Connection,
+        _: &QueueHandle<Self>,
     ) {
-        match event {
-            wl_buffer::Event::Release => {
-                // TODO: this is important for double buffer
-            }
-            _ => {}
-        }
     }
 }
+
+delegate_noop!(State: ignore wl_compositor::WlCompositor);
+delegate_noop!(State: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 
 impl Dispatch<wl_seat::WlSeat, ()> for State {
     fn event(
         state: &mut Self,
-        proxy: &wl_seat::WlSeat,
-        event: <wl_seat::WlSeat as wayland_client::Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
     ) {
-        match event {
-            wl_seat::Event::Capabilities { capabilities } => {
-                // TODO
+        let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(capabilities),
+        } = event
+        else {
+            return;
+        };
+
+        if capabilities.contains(wl_seat::Capability::Pointer) {
+            if state.wayland.wl_pointer.is_none() {
+                state.wayland.wl_pointer = Some(seat.get_pointer(qh, ()));
             }
-            wl_seat::Event::Name { name } => {
-                // TODO
-            }
-            _ => {}
+        } else if let Some(pointer) = state.wayland.wl_pointer.take() {
+            pointer.release();
         }
     }
 }
@@ -123,87 +623,186 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
 impl Dispatch<wl_pointer::WlPointer, ()> for State {
     fn event(
         state: &mut Self,
-        proxy: &wl_pointer::WlPointer,
-        event: <wl_pointer::WlPointer as wayland_client::Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
     ) {
-        // TODO: handle mouse event here (mapping to js event)
         match event {
             wl_pointer::Event::Enter {
-                serial,
                 surface,
                 surface_x,
                 surface_y,
-            } => {}
-            wl_pointer::Event::Leave { serial, surface } => {}
-            wl_pointer::Event::Motion {
-                time,
-                surface_x,
-                surface_y,
-            } => {}
-            wl_pointer::Event::Button {
-                serial,
-                time,
-                button,
-                state,
-            } => {}
-            wl_pointer::Event::Axis { time, axis, value } => {}
-            wl_pointer::Event::Frame => {}
-            wl_pointer::Event::AxisSource { axis_source } => {}
-            wl_pointer::Event::AxisStop { time, axis } => {}
-            wl_pointer::Event::AxisDiscrete { axis, discrete } => {}
-            wl_pointer::Event::AxisValue120 { axis, value120 } => {}
-            wl_pointer::Event::AxisRelativeDirection { axis, direction } => {}
-            wl_pointer::Event::Warp {
-                surface_x,
-                surface_y,
-            } => {}
-            _ => {}
-        }
-    }
-}
+                ..
+            } => {
+                let widget_id = state.wayland.widget_for_surface(&surface);
+                state.wayland.pointer_focus = widget_id;
+                state.wayland.pointer_x = surface_x;
+                state.wayland.pointer_y = surface_y;
 
-// TODO: should differentialize userdata to ensure that is from frame.
-// also this should be per surface, (e.g. different output may have different vsync).
-// So e.g. `FrameCallback(usize)`
-impl Dispatch<wl_callback::WlCallback, ()> for State {
-    fn event(
-        state: &mut Self,
-        proxy: &wl_callback::WlCallback,
-        event: <wl_callback::WlCallback as wayland_client::Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
-    ) {
-        match event {
-            wl_callback::Event::Done { callback_data } => {
-                // TODO: combine event and ... to draw.
+                if let Some(widget_id) = widget_id {
+                    state.queue_task(
+                        TaskSource::UserInteraction,
+                        Task::Pointer {
+                            widget_id,
+                            kind: PointerKind::Enter,
+                            x: surface_x,
+                            y: surface_y,
+                            button: 0,
+                            buttons: state.wayland.pointer_buttons,
+                        },
+                    );
+                }
+            }
+            wl_pointer::Event::Leave { .. } => {
+                if let Some(widget_id) = state.wayland.pointer_focus.take() {
+                    state.queue_task(
+                        TaskSource::UserInteraction,
+                        Task::Pointer {
+                            widget_id,
+                            kind: PointerKind::Leave,
+                            x: state.wayland.pointer_x,
+                            y: state.wayland.pointer_y,
+                            button: 0,
+                            buttons: state.wayland.pointer_buttons,
+                        },
+                    );
+                }
+                state.wayland.pointer_pressed = None;
+            }
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                state.wayland.pointer_x = surface_x;
+                state.wayland.pointer_y = surface_y;
+
+                if let Some(widget_id) = state.wayland.pointer_focus {
+                    state.queue_task(
+                        TaskSource::UserInteraction,
+                        Task::Pointer {
+                            widget_id,
+                            kind: PointerKind::Move,
+                            x: surface_x,
+                            y: surface_y,
+                            button: 0,
+                            buttons: state.wayland.pointer_buttons,
+                        },
+                    );
+                }
+            }
+            wl_pointer::Event::Button {
+                button,
+                state: button_state,
+                ..
+            } => {
+                let Some(widget_id) = state.wayland.pointer_focus else {
+                    return;
+                };
+
+                let (mask, dom_button) = match button {
+                    BTN_LEFT => (1, 0),
+                    BTN_RIGHT => (2, 2),
+                    BTN_MIDDLE => (4, 1),
+                    _ => return,
+                };
+
+                match button_state {
+                    WEnum::Value(wl_pointer::ButtonState::Pressed) => {
+                        state.wayland.pointer_buttons |= mask;
+                        state.queue_task(
+                            TaskSource::UserInteraction,
+                            Task::Pointer {
+                                widget_id,
+                                kind: PointerKind::Down,
+                                x: state.wayland.pointer_x,
+                                y: state.wayland.pointer_y,
+                                button: dom_button,
+                                buttons: state.wayland.pointer_buttons,
+                            },
+                        );
+
+                        if dom_button == 0 {
+                            state.wayland.pointer_pressed = Some(widget_id);
+                        } else if dom_button == 2 {
+                            state.queue_task(
+                                TaskSource::UserInteraction,
+                                Task::Pointer {
+                                    widget_id,
+                                    kind: PointerKind::ContextMenu,
+                                    x: state.wayland.pointer_x,
+                                    y: state.wayland.pointer_y,
+                                    button: dom_button,
+                                    buttons: state.wayland.pointer_buttons,
+                                },
+                            );
+                        }
+                    }
+                    WEnum::Value(wl_pointer::ButtonState::Released) => {
+                        state.wayland.pointer_buttons &= !mask;
+                        state.queue_task(
+                            TaskSource::UserInteraction,
+                            Task::Pointer {
+                                widget_id,
+                                kind: PointerKind::Up,
+                                x: state.wayland.pointer_x,
+                                y: state.wayland.pointer_y,
+                                button: dom_button,
+                                buttons: state.wayland.pointer_buttons,
+                            },
+                        );
+
+                        if dom_button == 0 && state.wayland.pointer_pressed == Some(widget_id) {
+                            state.queue_task(
+                                TaskSource::UserInteraction,
+                                Task::Pointer {
+                                    widget_id,
+                                    kind: PointerKind::Click,
+                                    x: state.wayland.pointer_x,
+                                    y: state.wayland.pointer_y,
+                                    button: dom_button,
+                                    buttons: state.wayland.pointer_buttons,
+                                },
+                            );
+                        }
+
+                        if dom_button == 0 {
+                            state.wayland.pointer_pressed = None;
+                        }
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
     }
 }
 
-impl Dispatch<wl_surface::WlSurface, ()> for State {
-    fn event(
-        state: &mut Self,
-        proxy: &wl_surface::WlSurface,
-        event: <wl_surface::WlSurface as wayland_client::Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
-    ) {
-        match event {
-            wl_surface::Event::Enter { output } => todo!(),
-            wl_surface::Event::Leave { output } => todo!(),
-            wl_surface::Event::PreferredBufferScale { factor } => todo!(),
-            wl_surface::Event::PreferredBufferTransform { transform } => todo!(),
-            _ => {}
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_anchor_flags_are_applied() {
+        let anchor = resolve_anchor(ANCHOR_TOP, 720, 280);
+        assert!(anchor.contains(Anchor::Top));
+        assert!(!anchor.contains(Anchor::Bottom));
+        assert!(!anchor.contains(Anchor::Left));
+        assert!(!anchor.contains(Anchor::Right));
+
+        let anchor = resolve_anchor(ANCHOR_TOP | ANCHOR_LEFT, 720, 280);
+        assert!(anchor.contains(Anchor::Top));
+        assert!(anchor.contains(Anchor::Left));
+    }
+
+    #[test]
+    fn zero_sized_dimensions_stretch() {
+        let anchor = resolve_anchor(ANCHOR_TOP, 0, 0);
+        assert!(anchor.contains(Anchor::Top));
+        assert!(anchor.contains(Anchor::Bottom));
+        assert!(anchor.contains(Anchor::Left));
+        assert!(anchor.contains(Anchor::Right));
     }
 }
-
-delegate_noop!(State: ignore wl_compositor::WlCompositor);
-delegate_noop!(State: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
