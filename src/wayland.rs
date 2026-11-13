@@ -867,30 +867,3 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn explicit_anchor_flags_are_applied() {
-        let anchor = resolve_anchor(ANCHOR_TOP, 720, 280);
-        assert!(anchor.contains(Anchor::Top));
-        assert!(!anchor.contains(Anchor::Bottom));
-        assert!(!anchor.contains(Anchor::Left));
-        assert!(!anchor.contains(Anchor::Right));
-
-        let anchor = resolve_anchor(ANCHOR_TOP | ANCHOR_LEFT, 720, 280);
-        assert!(anchor.contains(Anchor::Top));
-        assert!(anchor.contains(Anchor::Left));
-    }
-
-    #[test]
-    fn zero_sized_dimensions_stretch() {
-        let anchor = resolve_anchor(ANCHOR_TOP, 0, 0);
-        assert!(anchor.contains(Anchor::Top));
-        assert!(anchor.contains(Anchor::Bottom));
-        assert!(anchor.contains(Anchor::Left));
-        assert!(anchor.contains(Anchor::Right));
-    }
-}

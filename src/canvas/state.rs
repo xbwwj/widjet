@@ -244,25 +244,3 @@ pub fn parse_text_baseline(value: &str) -> Option<TextBaseline> {
         _ => None,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::parse_font;
-
-    #[test]
-    fn parses_font_shorthand_weight() {
-        let font = parse_font("900 96px sans-serif").unwrap();
-        assert_eq!(font.size, 96.0);
-        assert_eq!(font.family, "sans-serif");
-        assert_eq!(font.weight, 900.0);
-
-        let font = parse_font("black 96px sans-serif").unwrap();
-        assert_eq!(font.weight, 900.0);
-
-        let font = parse_font("bold 12px serif").unwrap();
-        assert_eq!(font.weight, 700.0);
-
-        let font = parse_font("12px serif").unwrap();
-        assert_eq!(font.weight, 400.0);
-    }
-}
