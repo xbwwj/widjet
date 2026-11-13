@@ -40,7 +40,8 @@ impl PointerKind {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum Task {
+pub enum Message {
+    /// The platform pointer event
     Pointer {
         widget_id: WidgetId,
         kind: PointerKind,
@@ -49,11 +50,13 @@ pub enum Task {
         button: u32,
         buttons: u32,
     },
-    Resize {
+    /// The platform configure / resize event
+    Configure {
         widget_id: WidgetId,
         width: u32,
         height: u32,
     },
+    /// The platform close event
     Close {
         widget_id: WidgetId,
     },
@@ -64,17 +67,17 @@ pub enum Task {
 }
 
 #[derive(Default)]
-pub struct TaskQueue {
-    user_interaction: VecDeque<Task>,
-    rendering: VecDeque<Task>,
-    timer: VecDeque<Task>,
+pub struct MessageQueue {
+    user_interaction: VecDeque<Message>,
+    rendering: VecDeque<Message>,
+    timer: VecDeque<Message>,
     timer_queued: bool,
     next_source: usize,
 }
 
-impl TaskQueue {
-    pub fn push(&mut self, source: TaskSource, task: Task) {
-        if matches!(task, Task::Timer) {
+impl MessageQueue {
+    pub fn push(&mut self, source: TaskSource, task: Message) {
+        if matches!(task, Message::Timer) {
             if self.timer_queued {
                 return;
             }
@@ -91,7 +94,7 @@ impl TaskQueue {
     /// Select one task using round-robin task-source selection. The HTML
     /// model does not define one global priority among task sources; round-robin
     /// avoids starving timers or rendering when input is continuously queued.
-    pub fn pop(&mut self) -> Option<Task> {
+    pub fn pop(&mut self) -> Option<Message> {
         for offset in 0..3 {
             let source = (self.next_source + offset) % 3;
             let task = match source {
@@ -104,7 +107,7 @@ impl TaskQueue {
             };
 
             self.next_source = (source + 1) % 3;
-            if matches!(task, Task::Timer) {
+            if matches!(task, Message::Timer) {
                 self.timer_queued = false;
             }
             return Some(task);
@@ -119,13 +122,13 @@ impl TaskQueue {
     /// Discard work that belongs to a surface which has been destroyed.
     /// Timer tasks are global and are intentionally left untouched.
     pub fn remove_widget_tasks(&mut self, widget_id: WidgetId) {
-        fn belongs_to(task: &Task, widget_id: WidgetId) -> bool {
+        fn belongs_to(task: &Message, widget_id: WidgetId) -> bool {
             match task {
-                Task::Pointer { widget_id: id, .. }
-                | Task::Resize { widget_id: id, .. }
-                | Task::Close { widget_id: id }
-                | Task::AnimationFrame { widget_id: id } => *id == widget_id,
-                Task::Timer => false,
+                Message::Pointer { widget_id: id, .. }
+                | Message::Configure { widget_id: id, .. }
+                | Message::Close { widget_id: id }
+                | Message::AnimationFrame { widget_id: id } => *id == widget_id,
+                Message::Timer => false,
             }
         }
 

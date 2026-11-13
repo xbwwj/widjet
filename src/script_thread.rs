@@ -10,7 +10,7 @@ use crate::{
     canvas::{CanvasId, CanvasOwner, CanvasStore, Size, WidgetId, WidgetStore},
     js::{self, TimerRegistry},
     platform::{Platform, PlatformError, PlatformEvent},
-    task::{Task, TaskQueue, TaskSource},
+    task::{Message, MessageQueue, TaskSource},
 };
 
 #[derive(Debug, Error)]
@@ -37,9 +37,8 @@ pub struct ScriptThread<P: Platform> {
     widgets: Rc<RefCell<WidgetStore>>,
 
     platform: P,
-    tasks: TaskQueue,
+    messages: MessageQueue,
     running: bool,
-    had_widget: bool,
     global_last_animation_frame_ms: f64,
     global_animation_frame_task_queued: bool,
 }
@@ -63,29 +62,29 @@ impl<P: Platform> ScriptThread<P> {
             canvases,
             widgets,
             platform,
-            tasks: TaskQueue::default(),
+            messages: MessageQueue::default(),
             running: true,
-            had_widget: false,
             global_last_animation_frame_ms,
             global_animation_frame_task_queued: false,
         }
     }
 
     pub fn run(mut self, user_code: &str) -> Result<(), ScriptThreadError> {
+        // initial eval
         self.eval_script(user_code)
             .map_err(|error| ScriptThreadError::UserScript(error.to_string()))?;
         self.microtask_checkpoint();
-        self.sync_platform_widgets();
+        self.reconcile_platform_widgets();
 
         while self.running {
+            // TODO: timer should be changed to poll till next deadline,
+            // rather than expire check
             self.schedule_due_timer();
 
-            // Run one task per turn. A microtask checkpoint follows the task,
-            // then shared state is reconciled before another task is selected.
-            if let Some(task) = self.tasks.pop() {
-                self.run_task(task);
+            if let Some(message) = self.messages.pop() {
+                self.handle_message(message);
                 self.microtask_checkpoint();
-                self.sync_platform_widgets();
+                self.reconcile_platform_widgets();
                 self.schedule_due_timer();
             }
 
@@ -95,15 +94,15 @@ impl<P: Platform> ScriptThread<P> {
             }
             self.prepare_animation_frame_tasks();
 
-            // Poll the native event source between task turns, even when the
-            // task queues remain busy. This prevents native input starvation.
-            let timeout = if self.tasks.is_empty() {
-                self.next_timeout()
-            } else {
-                Some(Duration::ZERO)
+            // TODO: the platform event gathering should be put at beginning of the loop
+            let timeout = match self.messages.is_empty() {
+                true => self.next_timeout(),
+                false => Default::default(),
             };
             let events = self.platform.dispatch(timeout)?;
             self.queue_platform_events(events);
+
+            // TODO: watchdog should be removed, we use platform vsync event
             self.check_frame_watchdog();
         }
 
@@ -246,12 +245,10 @@ impl<P: Platform> ScriptThread<P> {
         }
     }
 
-    fn sync_platform_widgets(&mut self) {
+    /// Sync the widget store state to platform inner.
+    fn reconcile_platform_widgets(&mut self) {
         let entries = self.widgets.borrow().snapshots();
         for (widget_id, state) in entries {
-            if state.materialized {
-                self.had_widget = true;
-            }
             if state.removed {
                 self.remove_widget(widget_id);
                 continue;
@@ -282,7 +279,6 @@ impl<P: Platform> ScriptThread<P> {
                 Some(_) => {}
             }
         }
-        self.stop_after_last_widget();
     }
 
     fn remove_widget(&mut self, widget_id: WidgetId) {
@@ -296,15 +292,9 @@ impl<P: Platform> ScriptThread<P> {
             // surface. Backends must make this operation idempotent.
             self.platform.destroy_widget(widget_id);
         }
-        self.tasks.remove_widget_tasks(widget_id);
+        self.messages.remove_widget_tasks(widget_id);
         self.forget_widget(widget_id);
         self.widgets.borrow_mut().remove(widget_id);
-    }
-
-    fn stop_after_last_widget(&mut self) {
-        if self.had_widget && self.widgets.borrow().active_materialized_len() == 0 {
-            self.running = false;
-        }
     }
 
     fn prepare_animation_frame_tasks(&mut self) {
@@ -358,25 +348,28 @@ impl<P: Platform> ScriptThread<P> {
                     state.animation_frame_task_queued = true;
                 });
         }
-        self.tasks
-            .push(TaskSource::Rendering, Task::AnimationFrame { widget_id });
+        self.messages
+            .push(TaskSource::Rendering, Message::AnimationFrame { widget_id });
     }
 
+    /// Check if there are timer due.
     fn schedule_due_timer(&mut self) {
-        if self.tasks.has_timer() {
+        if self.messages.has_timer() {
             return;
         }
         if self
             .next_timer_deadline_ms()
             .is_some_and(|deadline| deadline <= self.now_ms())
         {
-            self.tasks.push(TaskSource::Timer, Task::Timer);
+            self.messages.push(TaskSource::Timer, Message::Timer);
         }
     }
 
-    fn run_task(&mut self, task: Task) {
+    /// Handle an external message like platform message or timer message.
+    /// For most case, this is equivalent to a macro task.
+    fn handle_message(&mut self, task: Message) {
         match task {
-            Task::Pointer {
+            Message::Pointer {
                 widget_id,
                 kind,
                 x,
@@ -384,13 +377,13 @@ impl<P: Platform> ScriptThread<P> {
                 button,
                 buttons,
             } => self.dispatch_pointer_event(widget_id, kind.as_str(), x, y, button, buttons),
-            Task::Resize {
+            Message::Configure {
                 widget_id,
                 width,
                 height,
             } => self.dispatch_resize_event(widget_id, width, height),
-            Task::Close { widget_id } => self.close_widget(widget_id),
-            Task::AnimationFrame { widget_id } => {
+            Message::Close { widget_id } => self.close_widget(widget_id),
+            Message::AnimationFrame { widget_id } => {
                 if widget_id == 0 {
                     self.global_animation_frame_task_queued = false;
                     let now = self.now_ms();
@@ -421,7 +414,7 @@ impl<P: Platform> ScriptThread<P> {
                     }
                 }
             }
-            Task::Timer => {
+            Message::Timer => {
                 self.run_next_due_timer();
             }
         }
@@ -437,9 +430,9 @@ impl<P: Platform> ScriptThread<P> {
                     y,
                     button,
                     buttons,
-                } => self.tasks.push(
+                } => self.messages.push(
                     TaskSource::UserInteraction,
-                    Task::Pointer {
+                    Message::Pointer {
                         widget_id,
                         kind,
                         x,
@@ -454,8 +447,8 @@ impl<P: Platform> ScriptThread<P> {
                     height,
                 } => self.handle_configure(widget_id, width, height),
                 PlatformEvent::Closed { widget_id } => self
-                    .tasks
-                    .push(TaskSource::UserInteraction, Task::Close { widget_id }),
+                    .messages
+                    .push(TaskSource::UserInteraction, Message::Close { widget_id }),
                 PlatformEvent::FrameReady { widget_id } => {
                     self.queue_animation_frame(widget_id);
                 }
@@ -486,9 +479,9 @@ impl<P: Platform> ScriptThread<P> {
         }
 
         if changed {
-            self.tasks.push(
+            self.messages.push(
                 TaskSource::Rendering,
-                Task::Resize {
+                Message::Configure {
                     widget_id,
                     width,
                     height,
@@ -504,12 +497,7 @@ impl<P: Platform> ScriptThread<P> {
         }
         self.widgets.borrow_mut().mark_removed(widget_id);
         self.remove_widget(widget_id);
-        self.stop_after_last_widget();
     }
-
-    // ---------------------------------------------------------------------
-    // Rendering and frame scheduling.
-    // ---------------------------------------------------------------------
 
     fn update_rendering(&mut self) {
         let dirty = self.canvases.borrow().dirty_ids();

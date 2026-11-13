@@ -130,13 +130,6 @@ impl WidgetStore {
             .collect()
     }
 
-    pub fn active_materialized_len(&self) -> usize {
-        self.entries
-            .values()
-            .filter(|entry| entry.materialized && !entry.removed)
-            .count()
-    }
-
     pub fn is_active(&self, id: WidgetId) -> bool {
         self.entries
             .get(&id)
