@@ -1,6 +1,7 @@
 use std::{fs, path::PathBuf, process::ExitCode};
 
 use clap::Parser;
+use log::error;
 
 use crate::{script_thread::ScriptThread, wayland::WaylandPlatform};
 
@@ -20,12 +21,14 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
+    env_logger::init();
+
     let cli = Cli::parse();
 
     let js = match fs::read_to_string(&cli.script) {
         Ok(js) => js,
         Err(error) => {
-            eprintln!("widjet: failed to read {}: {error}", cli.script.display());
+            error!("widjet: failed to read {}: {error}", cli.script.display());
             return ExitCode::FAILURE;
         }
     };
@@ -33,7 +36,7 @@ fn main() -> ExitCode {
     let platform = match WaylandPlatform::new() {
         Ok(platform) => platform,
         Err(error) => {
-            eprintln!("widjet: {error}");
+            error!("widjet: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -41,7 +44,7 @@ fn main() -> ExitCode {
     match ScriptThread::new(platform).run(&js) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("widjet: {error}");
+            error!("widjet: {error}");
             ExitCode::FAILURE
         }
     }

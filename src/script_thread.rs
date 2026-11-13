@@ -2,6 +2,7 @@
 
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
+use log::error;
 use rquickjs::{Context, Function, Runtime};
 use thiserror::Error;
 
@@ -73,7 +74,7 @@ impl<P: Platform> ScriptThread<P> {
     pub fn run(mut self, user_code: &str) -> Result<(), ScriptThreadError> {
         self.eval_script(user_code)
             .map_err(|error| ScriptThreadError::UserScript(error.to_string()))?;
-        self.perform_microtask_checkpoint();
+        self.microtask_checkpoint();
         self.sync_platform_widgets();
 
         while self.running {
@@ -83,7 +84,7 @@ impl<P: Platform> ScriptThread<P> {
             // then shared state is reconciled before another task is selected.
             if let Some(task) = self.tasks.pop() {
                 self.run_task(task);
-                self.perform_microtask_checkpoint();
+                self.microtask_checkpoint();
                 self.sync_platform_widgets();
                 self.schedule_due_timer();
             }
@@ -135,16 +136,17 @@ impl<P: Platform> ScriptThread<P> {
             callback.call::<_, ()>(())
         });
         if let Err(error) = result {
-            eprintln!("widjet: timer callback failed: {error}");
+            error!("widjet: timer callback failed: {error}");
         }
         true
     }
 
-    pub(crate) fn perform_microtask_checkpoint(&self) {
+    pub(crate) fn microtask_checkpoint(&self) {
         loop {
             match self.runtime.execute_pending_job() {
-                Ok(true) => {}
+                // if there is no more micro task, break
                 Ok(false) => break,
+                // print error message
                 Err(exception) => {
                     let message = exception.0.with(|ctx| {
                         let value = ctx.catch();
@@ -160,8 +162,9 @@ impl<P: Platform> ScriptThread<P> {
                             .get::<String>()
                             .unwrap_or_else(|_| "unhandled exception".to_string())
                     });
-                    eprintln!("widjet: unhandled exception in microtask: {message}");
+                    error!("widjet: unhandled exception in microtask: {message}");
                 }
+                _ => {}
             }
         }
     }
@@ -182,7 +185,7 @@ impl<P: Platform> ScriptThread<P> {
             Ok::<_, rquickjs::Error>(())
         });
         if let Err(error) = result {
-            eprintln!("widjet: animation frame failed: {error}");
+            error!("widjet: animation frame failed: {error}");
         }
     }
 
@@ -193,7 +196,7 @@ impl<P: Platform> ScriptThread<P> {
             Ok::<_, rquickjs::Error>(())
         });
         if let Err(error) = result {
-            eprintln!("widjet: failed to forget widget {widget_id}: {error}");
+            error!("widjet: failed to forget widget {widget_id}: {error}");
         }
     }
 
@@ -239,7 +242,7 @@ impl<P: Platform> ScriptThread<P> {
             Ok::<_, rquickjs::Error>(())
         });
         if let Err(error) = result {
-            eprintln!("widjet: event dispatch failed: {error}");
+            error!("widjet: event dispatch failed: {error}");
         }
     }
 

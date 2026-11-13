@@ -9,6 +9,7 @@ mod widget_canvas;
 
 use std::{cell::RefCell, rc::Rc};
 
+use log::info;
 use rquickjs::{Class, Context, Function, JsLifetime, Persistent, class::Trace};
 
 const RUNTIME_JS: &str = include_str!("runtime.js");
@@ -56,7 +57,7 @@ pub(crate) fn install(
         Class::<TextMetrics>::define(&global).expect("failed to define TextMetrics");
 
         let log = Function::new(ctx.clone(), |message: String| {
-            println!("[js] {message}");
+            info!("{message}");
         })
         .expect("failed to create console host function");
         global
